@@ -48,6 +48,20 @@ internal class GalleryScanner(
 
 internal fun scaleCrownDelta(delta: Float, sensitivity: Float = 0.4f): Float = delta * sensitivity
 
+internal fun groupGalleryImages(images: List<Pic>, includeHidden: Boolean): LinkedHashMap<String, MutableList<Pic>> {
+    val grouped = linkedMapOf<String, MutableList<Pic>>()
+    for (image in images) {
+        val file = File(image.path)
+        if (!includeHidden && file.name.startsWith(".")) continue
+        grouped.getOrPut(image.folder) { mutableListOf() }.add(image)
+    }
+    for (photos in grouped.values) {
+        photos.sortWith(compareByDescending<Pic> { it.modified }.thenBy { it.path })
+    }
+    return grouped
+}
+
+
 internal fun bitmapSampleSize(
     sourceWidth: Int,
     sourceHeight: Int,

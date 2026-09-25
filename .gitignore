@@ -1,3 +1,11 @@
+# Local signing secrets
+keystore.properties
+*.jks
+*.keystore
+
+# Test extraction/output
+.manga-test/
+
 # Android/Gradle
 .gradle/
 **/build/

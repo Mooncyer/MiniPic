@@ -32,6 +32,19 @@ class GalleryModelTest {
         assertTrue(naturalFileNameCompare("A02.webp", "a2.webp") > 0)
     }
     @Test
+    fun mediaStoreImagesGroupByFolderAndKeepModifiedOrder() {
+        val folder = "Pictures/Manga"
+        val input = listOf(
+            Pic("/storage/emulated/0/$folder/02.webp", folder, 10, 2),
+            Pic("/storage/emulated/0/$folder/01.webp", folder, 20, 2),
+            Pic("/storage/emulated/0/$folder/.hidden.webp", folder, 30, 2)
+        )
+
+        val result = groupGalleryImages(input, includeHidden = false)
+
+        assertEquals(listOf("01.webp", "02.webp"), result[folder]?.map { File(it.path).name })
+    }
+    @Test
     fun crownSensitivityScalesEveryInputToFortyPercent() {
         assertEquals(4f, scaleCrownDelta(10f), 0f)
         assertEquals(-2f, scaleCrownDelta(-5f), 0f)

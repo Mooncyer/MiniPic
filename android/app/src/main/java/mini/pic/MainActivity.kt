@@ -159,15 +159,7 @@ class MainActivity : Activity() {
                 .setMessage("完整管理相册需要文件访问权限；也可以只授予图片读取权限。")
                 .setNegativeButton("暂不") { _, _ -> showPermissionHint() }
                 .setNeutralButton("仅浏览图片") { _, _ -> requestPermissions(arrayOf(readPermission), 9) }
-                .setPositiveButton("完整访问") { _, _ ->
-                    permissionSettingsRequested = true
-                    try {
-                        startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                            .setData(Uri.parse("package:$packageName")))
-                    } catch (_: Exception) {
-                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                    }
-                }
+                .setPositiveButton("完整访问") { _, _ -> requestAllFilesAccess() }
                 .setOnCancelListener { showPermissionHint() }
                 .show()
             return
@@ -223,18 +215,36 @@ class MainActivity : Activity() {
                 .setTitle("需要文件访问权限")
                 .setMessage("为了复制、移动和删除图片，请授予「所有文件访问权限」")
                 .setNegativeButton("取消") { _, _ -> pendingWriteAction = null }
-                .setPositiveButton("去设置") { _, _ ->
-                    permissionSettingsRequested = true
-                    try {
-                        startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                            .setData(Uri.parse("package:$packageName")))
-                    } catch (_: Exception) {
-                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                    }
-                }.show()
+                .setPositiveButton("去设置") { _, _ -> requestAllFilesAccess() }.show()
         } else {
             pendingWriteAction = onGranted
             requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 10)
+        }
+    }
+
+    private fun galleryScanner(): GalleryScanner? {
+        val includeHidden = prefs.getBoolean("hidden", false)
+        if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) {
+            return GalleryScanner(File("/storage/emulated/0"), includeHidden)
+        }
+        return null
+    }
+
+    private fun requestAllFilesAccess() {
+        permissionSettingsRequested = true
+        val packageIntent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+            .setData(Uri.parse("package:$packageName"))
+        val fallbackIntent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+        try {
+            startActivity(packageIntent)
+        } catch (_: Exception) {
+            try {
+                startActivity(fallbackIntent)
+            } catch (_: Exception) {
+                permissionSettingsRequested = false
+                showPermissionHint()
+                toast("请在系统设置中授予图库文件访问权限")
+            }
         }
     }
 
@@ -247,7 +257,7 @@ class MainActivity : Activity() {
         permissionDenied = false
         scanning = true
         io.execute {
-            val found = GalleryScanner(File("/storage/emulated/0"), prefs.getBoolean("hidden", false)).scan()
+            val found = galleryScanner()?.scan() ?: scanMediaStoreImages()
             saveCache(found)
             runOnUiThread {
                 scanning = false
@@ -271,6 +281,50 @@ class MainActivity : Activity() {
                 }
             }
         }
+    }
+
+
+    private fun scanMediaStoreImages(): LinkedHashMap<String, MutableList<Pic>> {
+        val all = mutableListOf<Pic>()
+        val projection = arrayOf(
+            MediaStore.Images.Media.DATA,
+            MediaStore.Images.Media.RELATIVE_PATH,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.DATE_MODIFIED,
+            MediaStore.Images.Media.SIZE,
+            MediaStore.Images.Media.MIME_TYPE
+        )
+        val includeHidden = prefs.getBoolean("hidden", false)
+        val cursor = try {
+            contentResolver.query(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                projection, null, null, "${MediaStore.Images.Media.DATE_MODIFIED} DESC"
+            )
+        } catch (_: Exception) { null } ?: return linkedMapOf()
+        cursor.use {
+            val dataIndex = it.getColumnIndex(MediaStore.Images.Media.DATA)
+            val relativeIndex = it.getColumnIndex(MediaStore.Images.Media.RELATIVE_PATH)
+            val nameIndex = it.getColumnIndex(MediaStore.Images.Media.DISPLAY_NAME)
+            val modifiedIndex = it.getColumnIndex(MediaStore.Images.Media.DATE_MODIFIED)
+            val sizeIndex = it.getColumnIndex(MediaStore.Images.Media.SIZE)
+            val mimeIndex = it.getColumnIndex(MediaStore.Images.Media.MIME_TYPE)
+            while (it.moveToNext()) {
+                val name = if (nameIndex >= 0) it.getString(nameIndex) ?: continue else continue
+                if (!includeHidden && name.startsWith(".")) continue
+                val mime = if (mimeIndex >= 0) it.getString(mimeIndex) ?: "" else ""
+                if (!mime.startsWith("image/")) continue
+                val path = if (dataIndex >= 0) it.getString(dataIndex) else null
+                if (path.isNullOrBlank()) continue
+                val folder = if (relativeIndex >= 0) {
+                    val relative = it.getString(relativeIndex).orEmpty().trimEnd('/')
+                    File("/storage/emulated/0", relative).absolutePath
+                } else File(path).parentFile?.absolutePath ?: continue
+                val modifiedSeconds = if (modifiedIndex >= 0) it.getLong(modifiedIndex) else 0L
+                val size = if (sizeIndex >= 0) it.getLong(sizeIndex) else File(path).length()
+                all += Pic(path, folder, modifiedSeconds * 1000L, size)
+            }
+        }
+        return groupGalleryImages(all, includeHidden)
     }
 
 
