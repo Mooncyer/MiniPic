@@ -1,15 +1,18 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
     <application android:theme="@style/AppTheme" android:label="图库" android:icon="@mipmap/ic_launcher" android:allowBackup="false" android:supportsRtl="true">
         <uses-library android:name="com.google.android.wearable" android:required="false" />
-        <activity android:name=".MainActivity" android:screenOrientation="portrait" android:exported="true">
+        <activity android:name=".MainActivity" android:screenOrientation="portrait" android:launchMode="singleTop" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.DEFAULT" /><category android:name="android.intent.category.BROWSABLE" /><data android:mimeType="image/*" />
+            <intent-filter tools:ignore="AppLinkUrlError">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
             </intent-filter>
         </activity>
     </application>

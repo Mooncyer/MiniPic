@@ -1,6 +1,7 @@
 package mini.pic
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.*
 import android.content.*
 import android.content.pm.PackageManager
@@ -12,24 +13,25 @@ import android.net.Uri
 import android.os.*
 import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.*
 import android.view.animation.DecelerateInterpolator
 import android.widget.*
+import androidx.recyclerview.widget.DiffUtil
+import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.switchmaterial.SwitchMaterial
 import java.io.File
 import java.io.IOException
-import java.util.Locale
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import kotlin.math.*
 
-private const val SIGNATURE = ".MiniPicGallerySignature.png"
-private val EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif")
-data class Pic(val path: String, val folder: String, val modified: Long)
+private const val SIGNATURE = GALLERY_SIGNATURE
 
 enum class Page { ALBUMS, SETTINGS, VIEWER, ACTIONS, PICK_ALBUM, SELECT_ALBUMS }
 
@@ -38,15 +40,16 @@ class MainActivity : Activity() {
     private lateinit var stableRoot: GestureFrameLayout
 
     private val io = Executors.newSingleThreadExecutor()
-    // Album cover bitmap cache: path → Bitmap (soft refs allow GC to reclaim)
+    private val fileIo = Executors.newSingleThreadExecutor()
+    private val coverIo = Executors.newFixedThreadPool(2)
     private val coverCache = object : LinkedHashMap<String, Bitmap>(32, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>): Boolean = size > 24
     }
     private val albums = linkedMapOf<String, MutableList<Pic>>()
     private var page = Page.ALBUMS
     private var previousPage = Page.ALBUMS
-    private var albumGrid: ViewGroup? = null
-    private var albumScroll: ScrollView? = null
+    private var albumGrid: RecyclerView? = null
+    private var albumAdapter: AlbumAdapter? = null
     private var settingsScroll: ScrollView? = null
     private var pickerScroll: ScrollView? = null
     private var selectScroll: ScrollView? = null
@@ -98,9 +101,14 @@ class MainActivity : Activity() {
 
     override fun onNewIntent(newIntent: Intent?) {
         super.onNewIntent(newIntent)
-        if (newIntent?.action == Intent.ACTION_VIEW && newIntent.data != null) {
-            intent = newIntent
+        if (newIntent == null) return
+        intent = newIntent
+        if (newIntent.action == Intent.ACTION_VIEW && newIntent.data != null) {
             showExternal(newIntent.data!!)
+        } else if (newIntent.action == Intent.ACTION_MAIN) {
+            showAlbums()
+            loadCache()
+            ensurePermissionAndScan()
         }
     }
 
@@ -108,25 +116,81 @@ class MainActivity : Activity() {
     //  PERMISSIONS & SCAN
     // ══════════════════════════════════════════════════════════════════
 
+    private var permissionSettingsRequested = false
+    private var pendingWriteAction: (() -> Unit)? = null
+    private var permissionDenied = false
+
+    private fun readImagesPermission(): String = if (Build.VERSION.SDK_INT >= 33)
+        Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
+
+    private fun hasGalleryReadAccess(): Boolean =
+        (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) ||
+            checkSelfPermission(readImagesPermission()) == PackageManager.PERMISSION_GRANTED
+
     private fun ensurePermissionAndScan() {
-        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE), 9)
-        } else scan()
+        if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+            val readPermission = readImagesPermission()
+            if (checkSelfPermission(readPermission) == PackageManager.PERMISSION_GRANTED) {
+                scan()
+                return
+            }
+            MaterialAlertDialogBuilder(this)
+                .setTitle("需要图库访问权限")
+                .setMessage("完整管理相册需要文件访问权限；也可以只授予图片读取权限。")
+                .setNegativeButton("暂不") { _, _ -> showPermissionHint() }
+                .setNeutralButton("仅浏览图片") { _, _ -> requestPermissions(arrayOf(readPermission), 9) }
+                .setPositiveButton("完整访问") { _, _ ->
+                    permissionSettingsRequested = true
+                    try {
+                        startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                            .setData(Uri.parse("package:$packageName")))
+                    } catch (_: Exception) {
+                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    }
+                }
+                .setOnCancelListener { showPermissionHint() }
+                .show()
+            return
+        }
+        if (!hasGalleryReadAccess()) {
+            requestPermissions(arrayOf(readImagesPermission()), 9)
+            return
+        }
+        scan()
+    }
+
+    private fun showPermissionHint() {
+        permissionDenied = true
+        if (page == Page.ALBUMS && albums.isEmpty()) albumAdapter?.notifyItemChanged(0)
+        toast("未授予图库访问权限")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (permissionSettingsRequested) {
+            permissionSettingsRequested = false
+            if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
+                scan()
+                pendingWriteAction?.also { pendingWriteAction = null; it() }
+            } else {
+                showPermissionHint()
+            }
+        }
     }
 
     override fun onRequestPermissionsResult(code: Int, p: Array<out String>, g: IntArray) {
         super.onRequestPermissionsResult(code, p, g)
-        if (code == 9 && g.firstOrNull() == PackageManager.PERMISSION_GRANTED) scan()
+        if (code == 9 && g.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            permissionDenied = false
+            scan()
+        } else if (code == 9) showPermissionHint()
+        if (code == 10 && g.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            pendingWriteAction?.also { pendingWriteAction = null; it() }
+        } else if (code == 10) toast("未授予文件写入权限")
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  WRITE ACCESS  (Android 11 MANAGE_EXTERNAL_STORAGE)
-    // ══════════════════════════════════════════════════════════════════
-
     private fun hasWriteAccess(): Boolean {
-        if (Build.VERSION.SDK_INT >= 30) {
-            return Environment.isExternalStorageManager()
-        }
+        if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager()
         return checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
     }
 
@@ -134,37 +198,43 @@ class MainActivity : Activity() {
         if (hasWriteAccess()) {
             onGranted()
         } else if (Build.VERSION.SDK_INT >= 30) {
+            pendingWriteAction = onGranted
             MaterialAlertDialogBuilder(this)
                 .setTitle("需要文件访问权限")
                 .setMessage("为了复制、移动和删除图片，请授予「所有文件访问权限」")
-                .setNegativeButton("取消", null)
+                .setNegativeButton("取消") { _, _ -> pendingWriteAction = null }
                 .setPositiveButton("去设置") { _, _ ->
+                    permissionSettingsRequested = true
                     try {
                         startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                            .setData(Uri.parse("package:mini.pic")))
+                            .setData(Uri.parse("package:$packageName")))
                     } catch (_: Exception) {
-                        toast("请手动在 设置-应用管理-图库 中授予存储权限")
+                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
                     }
                 }.show()
         } else {
+            pendingWriteAction = onGranted
             requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 10)
         }
     }
 
-    /** Background scan: show current state first, then update in-place when done. */
     private fun scan() {
-        if (scanning) return
+        if (!hasGalleryReadAccess()) {
+            ensurePermissionAndScan()
+            return
+        }
+        if (scanning || isFinishing || isDestroyed) return
+        permissionDenied = false
         scanning = true
         io.execute {
-            val found = linkedMapOf<String, MutableList<Pic>>()
-            val base = File("/storage/emulated/0")
-            if (base.exists()) walk(base, found)
+            val found = GalleryScanner(File("/storage/emulated/0"), prefs.getBoolean("hidden", false)).scan()
+            saveCache(found)
             runOnUiThread {
                 scanning = false
-                val sameAsBefore =
-                    albums.size == found.size && albums.all { (k, v) -> found[k]?.size == v.size }
-                albums.clear(); albums.putAll(found)
-                val allPaths = found.values.flatten().map { it.path }.toSet()
+                val changed = !sameGallerySnapshot(albums, found)
+                albums.clear()
+                albums.putAll(found)
+                val allPaths = found.values.asSequence().flatten().map { it.path }.toHashSet()
                 coverPrefs.edit().apply {
                     for (folder in albums.keys) {
                         val saved = coverPrefs.getString(folder, null)
@@ -172,13 +242,8 @@ class MainActivity : Activity() {
                     }
                     apply()
                 }
-                saveCache()
-                if (sameAsBefore && page == Page.ALBUMS) {
-                    // Data unchanged — just remove hint if present
-                    albumGrid?.findViewWithTag<View>("scanning_hint")?.let { albumGrid?.removeView(it) }
-                } else if (page == Page.ALBUMS) {
-                    replaceAlbumsGrid()
-                    albumGrid?.findViewWithTag<View>("scanning_hint")?.let { albumGrid?.removeView(it) }
+                if (page == Page.ALBUMS) {
+                    if (changed) replaceAlbumsGrid() else if (albumAdapter?.itemCount == 1) albumAdapter?.notifyItemChanged(0)
                 } else if (page == Page.PICK_ALBUM) {
                     rebuildAlbumPicker()
                 } else if (page == Page.SELECT_ALBUMS) {
@@ -188,68 +253,67 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun walk(dir: File, out: LinkedHashMap<String, MutableList<Pic>>) {
-        val hidden = prefs.getBoolean("hidden", false)
-        if (!dir.isDirectory || (!hidden && dir.name.startsWith("."))) return
-        val files = try { dir.listFiles() } catch (_: Exception) { null } ?: return
-        val list = mutableListOf<Pic>()
-        var signature = false
-        for (file in files) {
-            if (file.isDirectory) walk(file, out)
-            else if (file.name == SIGNATURE) signature = true
-            else if (file.extension.lowercase(Locale.US) in EXTENSIONS && (hidden || !file.name.startsWith(".")))
-                list += Pic(file.absolutePath, dir.absolutePath, file.lastModified())
-        }
-        if (list.isNotEmpty() || signature) {
-            list.sortByDescending { it.modified }
-            out[dir.absolutePath] = list
-        }
-    }
 
     private val CACHE_FILE = "album_cache.json"
 
-    private fun saveCache() {
-        io.execute {
-            try {
-                val json = JSONArray()
-                for ((folder, photos) in albums) {
-                    val album = JSONObject()
-                    album.put("folder", folder)
-                    val pics = JSONArray()
-                    for (pic in photos) {
-                        val p = JSONObject()
-                        p.put("path", pic.path)
-                        p.put("folder", pic.folder)
-                        p.put("modified", pic.modified)
-                        pics.put(p)
-                    }
-                    album.put("photos", pics)
-                    json.put(album)
+    private fun saveCache(snapshot: Map<String, List<Pic>>) {
+        try {
+            val json = JSONArray()
+            for ((folder, photos) in snapshot) {
+                val album = JSONObject().put("folder", folder)
+                val pics = JSONArray()
+                for (pic in photos) {
+                    pics.put(JSONObject()
+                        .put("path", pic.path)
+                        .put("folder", pic.folder)
+                        .put("modified", pic.modified)
+                        .put("size", pic.size))
                 }
-                openFileOutput(CACHE_FILE, MODE_PRIVATE).use { it.write(json.toString().toByteArray()) }
-            } catch (_: Exception) {}
-        }
+                album.put("photos", pics)
+                json.put(album)
+            }
+            val temp = File(filesDir, "$CACHE_FILE.tmp")
+            temp.writeText(json.toString())
+            val target = File(filesDir, CACHE_FILE)
+            if (!temp.renameTo(target)) {
+                target.writeText(temp.readText())
+                temp.delete()
+            }
+        } catch (_: Exception) {}
     }
 
     private fun loadCache() {
-        try {
-            val text = openFileInput(CACHE_FILE).bufferedReader().readText()
-            val json = JSONArray(text)
-            albums.clear()
-            for (i in 0 until json.length()) {
-                val album = json.getJSONObject(i)
-                val folder = album.getString("folder")
-                val photos = mutableListOf<Pic>()
-                val pics = album.getJSONArray("photos")
-                for (j in 0 until pics.length()) {
-                    val p = pics.getJSONObject(j)
-                    photos += Pic(p.getString("path"), p.getString("folder"), p.getLong("modified"))
+        io.execute {
+            val cached = try {
+                val json = JSONArray(openFileInput(CACHE_FILE).bufferedReader().use { it.readText() })
+                linkedMapOf<String, MutableList<Pic>>().apply {
+                    for (i in 0 until json.length()) {
+                        val album = json.getJSONObject(i)
+                        val folder = album.getString("folder")
+                        val photos = mutableListOf<Pic>()
+                        val pics = album.getJSONArray("photos")
+                        for (j in 0 until pics.length()) {
+                            val p = pics.getJSONObject(j)
+                            val path = p.getString("path")
+                            val file = File(path)
+                            if (path.startsWith("content:")) continue
+                            if (file.isFile && (p.optLong("size", -1L) == -1L ||
+                                    (file.length() == p.optLong("size") && file.lastModified() == p.optLong("modified")))) {
+                                photos += Pic(path, p.getString("folder"), p.getLong("modified"), file.length())
+                            }
+                        }
+                        if (photos.isNotEmpty() || File(folder, SIGNATURE).exists()) put(folder, photos)
+                    }
                 }
-                albums[folder] = photos
+            } catch (_: Exception) { linkedMapOf() }
+            if (isFinishing || isDestroyed) return@execute
+            runOnUiThread {
+                if (albums.isEmpty() && cached.isNotEmpty()) {
+                    albums.putAll(cached)
+                    if (page == Page.ALBUMS) replaceAlbumsGrid()
+                }
             }
-            // Update the grid with cached data
-            if (page == Page.ALBUMS) replaceAlbumsGrid()
-        } catch (_: Exception) {}
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -438,13 +502,21 @@ class MainActivity : Activity() {
         val newHost = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         newHost.addView(newPhoto, FrameLayout.LayoutParams(-1, -1))
 
-        // Pre-load bitmap, then animate
-        io.execute {
-            val drawable = decodeDrawable(currentUri())
+        val generation = ++imageLoadGeneration
+        val uri = currentUri()
+        val rotationForLoad = rotation
+        coverIo.execute {
+            val drawable = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels * 2),
+                max(1, resources.displayMetrics.heightPixels * 2))
+            if (isFinishing || isDestroyed) return@execute
             runOnUiThread {
+                if (generation != imageLoadGeneration || page != Page.VIEWER || isFinishing || isDestroyed) {
+                    animating = false
+                    return@runOnUiThread
+                }
                 if (drawable == null) { animating = false; return@runOnUiThread }
                 newPhoto.setDrawable(drawable)
-                newPhoto.rotation = rotation
+                newPhoto.rotation = rotationForLoad
                 (drawable as? Animatable)?.start()
 
                 // New starts from the opposite side and slides into view
@@ -479,43 +551,90 @@ class MainActivity : Activity() {
     private fun buildAlbumsPage(): View {
         page = Page.ALBUMS
         previousPage = Page.ALBUMS
-        albumScroll = ScrollView(this).apply { isFillViewport = true; overScrollMode = View.OVER_SCROLL_NEVER }
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(7), dp(2), dp(7), dp(10))
         }
-        column.addView(label("相册", 20f, true).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(-1, dp(33)))
+        column.addView(label("相册", 20f, true).apply { gravity = Gravity.CENTER },
+            LinearLayout.LayoutParams(-1, dp(33)))
 
-        val grid = GridLayout(this).apply { columnCount = 2; alignmentMode = GridLayout.ALIGN_BOUNDS }
-        albumGrid = grid
-        populateAlbumGrid(grid)
-        column.addView(grid)
-
-        if (albums.isEmpty()) {
-            val hint = label(if (scanning) "正在扫描…" else "暂无相册", 14f).apply {
-                gravity = Gravity.CENTER; tag = "scanning_hint"
+        albumGrid = RecyclerView(this).apply {
+            val manager = GridLayoutManager(this@MainActivity, 2)
+            layoutManager = manager
+            overScrollMode = View.OVER_SCROLL_NEVER
+            itemAnimator = null
+            manager.spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
+                override fun getSpanSize(position: Int): Int =
+                    if (albumAdapter?.itemCount == 1 && albums.isEmpty()) 2 else 1
             }
-            grid.addView(hint, GridLayout.LayoutParams().apply {
-                width = dp(175); height = dp(140)
-                columnSpec = GridLayout.spec(0, 2)
-            })
         }
-        albumScroll!!.addView(column)
-        return albumScroll!!
+        albumAdapter = AlbumAdapter().also { albumGrid!!.adapter = it }
+        replaceAlbumsGrid()
+        column.addView(albumGrid, LinearLayout.LayoutParams(-1, 0, 1f))
+
+        return column
     }
 
-    private fun populateAlbumGrid(grid: ViewGroup) {
+    private fun visibleAlbums(): List<Pair<String, List<Pic>>> {
         val showFolders = homeSelectedFolders()
-        for ((folder, photos) in albums) {
-            if (folder in showFolders) grid.addView(albumCard(folder, photos), gridParams())
-        }
+        return albums.entries
+            .filter { it.key in showFolders }
+            .map { it.key to it.value }
     }
 
-    /** In-place grid update after background scan completes. */
     private fun replaceAlbumsGrid() {
-        val grid = albumGrid ?: return
-        grid.removeAllViews()
-        populateAlbumGrid(grid)
+        albumAdapter?.submitList(visibleAlbums())
+    }
+
+    private inner class AlbumAdapter : RecyclerView.Adapter<AlbumAdapter.Holder>() {
+        private var items: List<Pair<String, List<Pic>>> = emptyList()
+
+        inner class Holder(val host: FrameLayout) : RecyclerView.ViewHolder(host)
+
+        fun submitList(next: List<Pair<String, List<Pic>>>) {
+            val previous = items
+            val oldCount = max(1, previous.size)
+            val newCount = max(1, next.size)
+            val diff = DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+                override fun getOldListSize(): Int = oldCount
+                override fun getNewListSize(): Int = newCount
+                override fun areItemsTheSame(oldPosition: Int, newPosition: Int): Boolean {
+                    if (previous.isEmpty() || next.isEmpty()) return previous.isEmpty() && next.isEmpty()
+                    return previous[oldPosition].first == next[newPosition].first
+                }
+                override fun areContentsTheSame(oldPosition: Int, newPosition: Int): Boolean {
+                    if (previous.isEmpty() || next.isEmpty()) return true
+                    return previous[oldPosition] == next[newPosition]
+                }
+            })
+            items = next
+            diff.dispatchUpdatesTo(this)
+            if (items.isEmpty()) notifyItemChanged(0)
+        }
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder =
+            Holder(FrameLayout(this@MainActivity))
+
+        override fun getItemCount(): Int = if (items.isEmpty()) 1 else items.size
+
+        override fun onBindViewHolder(holder: Holder, position: Int) {
+            holder.host.removeAllViews()
+            if (items.isEmpty()) {
+                holder.host.addView(label(
+                    when {
+                        permissionDenied -> "需要图片访问权限"
+                        scanning -> "正在扫描…"
+                        else -> "暂无相册"
+                    }, 14f
+                ).apply {
+                    gravity = Gravity.CENTER
+                    layoutParams = FrameLayout.LayoutParams(-1, dp(140))
+                })
+                return
+            }
+            val (folder, photos) = items[position]
+            holder.host.addView(albumCard(folder, photos), FrameLayout.LayoutParams(-1, dp(100)))
+        }
     }
 
     private fun buildSettingsPage(): View {
@@ -548,16 +667,26 @@ class MainActivity : Activity() {
         return column
     }
 
+    private var imageLoadGeneration = 0L
+
     private fun buildViewerPage(): View {
         page = Page.VIEWER
         updateSystemUi(true)
         val host = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        viewer = PhotoView(this).apply { setBackgroundColor(Color.BLACK) }
-        host.addView(viewer, FrameLayout.LayoutParams(-1, -1))
-        io.execute {
-            val drawable = decodeDrawable(currentUri())
+        val photo = PhotoView(this).apply { setBackgroundColor(Color.BLACK) }
+        viewer = photo
+        host.addView(photo, FrameLayout.LayoutParams(-1, -1))
+        val generation = ++imageLoadGeneration
+        val uri = currentUri()
+        val rotationForLoad = rotation
+        coverIo.execute {
+            val drawable = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels * 2),
+                max(1, resources.displayMetrics.heightPixels * 2))
+            if (isFinishing || isDestroyed) return@execute
             runOnUiThread {
-                viewer?.setDrawable(drawable); viewer?.rotation = rotation
+                if (generation != imageLoadGeneration || isFinishing || isDestroyed) return@runOnUiThread
+                photo.setDrawable(drawable)
+                photo.rotation = rotationForLoad
                 (drawable as? Animatable)?.start()
             }
         }
@@ -570,64 +699,22 @@ class MainActivity : Activity() {
 
     private fun showExternal(uri: Uri) {
         previousPage = Page.ALBUMS
-
-        // Try to resolve content:// URI to a real file path
-        val realPath: String? = try {
-            when {
-                // content://media/external/images/media/N → query _data
-                uri.authority == "media" -> {
-                    val cursor = contentResolver.query(uri, arrayOf(MediaStore.Images.Media.DATA), null, null, null)
-                    cursor?.use { if (it.moveToFirst()) it.getString(0) else null }
-                }
-                // content://com.android.externalstorage.documents/... → DocumentsContract
-                DocumentsContract.isDocumentUri(this, uri) -> {
-                    val docId = DocumentsContract.getDocumentId(uri)
-                    // docId = "primary:Pictures/photo.jpg" → extract path
-                    val parts = docId.split(":", limit = 2)
-                    if (parts.size == 2 && parts[0] == "primary")
-                        "/storage/emulated/0/${parts[1]}"
-                    else null
-                }
-                // file:///storage/... → already a path
-                uri.scheme == "file" -> uri.path
-                else -> null
-            }
-        } catch (_: Exception) { null }
-
-        if (realPath != null && File(realPath).exists()) {
-            // Use real path directly — operations via MediaStore will find it
-            val folder = File(realPath).parentFile?.absolutePath ?: ""
-            viewerPics = listOf(Pic(realPath, folder, File(realPath).lastModified()))
-        } else {
-            // Fallback: copy to cache so operations at least work on the copy
-            val fileName = try {
-                val cursor = contentResolver.query(uri, arrayOf("_display_name"), null, null, null)
-                cursor?.use { if (it.moveToFirst()) it.getString(0) ?: "image.jpg" else "image.jpg" } ?: "image.jpg"
-            } catch (_: Exception) { uri.lastPathSegment ?: "image.jpg" }
-            val cacheDir = File(cacheDir, "external")
-            cacheDir.mkdirs()
-            val cached = File(cacheDir, fileName)
-            if (!cached.exists()) {
-                try {
-                    contentResolver.openInputStream(uri)?.use { input ->
-                        cached.outputStream().use { output -> input.copyTo(output) }
-                    }
-                } catch (_: Exception) {}
-            }
-            viewerPics = listOf(Pic(cached.absolutePath, cached.parentFile?.absolutePath ?: "", cached.lastModified()))
-        }
-
-        viewerIndex = 0; rotation = 0f
+        viewerPics = listOf(Pic(uri.toString(), "", 0L, 0L))
+        viewerIndex = 0
+        rotation = 0f
         replaceContent(buildViewerPage())
     }
 
     private fun showViewer(list: List<Pic>, index: Int, from: Page) {
-        previousPage = from; viewerPics = list; viewerIndex = index; rotation = 0f
+        previousPage = from
+        viewerPics = list
+        viewerIndex = index
+        rotation = 0f
         replaceContent(buildViewerPage())
     }
 
     private fun showPhotoView() {
-        previousPage = page
+        if (page != Page.ACTIONS && page != Page.PICK_ALBUM) previousPage = page
         val building = buildViewerPage()
         replaceContent(building)
     }
@@ -637,11 +724,7 @@ class MainActivity : Activity() {
     // ══════════════════════════════════════════════════════════════════
 
     private fun showAlbumPicker() {
-        if (albums.isEmpty()) {
-            toast("正在扫描相册…")
-            scan()
-            // Show a placeholder, scan will trigger rebuild
-        }
+        scan()
         replaceContent(buildAlbumPickerPage())
     }
 
@@ -694,9 +777,12 @@ class MainActivity : Activity() {
             scaleType = ImageView.ScaleType.CENTER_CROP
             setBackgroundColor(if (dark) Color.rgb(44, 48, 49) else Color.rgb(225, 231, 231))
             layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply { setMargins(0, 0, dp(10), 0) }
-            if (photos.isNotEmpty()) io.execute {
-                val b = decodeSampled(photos[0].path, 72, 72)
-                runOnUiThread { if (tag == folder) setImageBitmap(b) }
+            if (photos.isNotEmpty()) coverIo.execute {
+                val bitmap = try {
+                    decodeSampled(photos[0].path, 72, 72)
+                } catch (_: Throwable) { null }
+                if (isFinishing || isDestroyed) return@execute
+                runOnUiThread { if (tag == folder) setImageBitmap(bitmap) }
             }
             tag = folder
         }
@@ -712,30 +798,26 @@ class MainActivity : Activity() {
         pendingFileOp = null
         val srcPath = pic.path
 
-        io.execute {
+        fileIo.execute {
             val result = try {
-                val srcName = if (srcPath.startsWith("content:")) {
-                    try {
-                        val cursor = contentResolver.query(Uri.parse(srcPath), arrayOf("_display_name"), null, null, null)
-                        cursor?.use { if (it.moveToFirst()) it.getString(0) ?: "image.jpg" else "image.jpg" } ?: "image.jpg"
-                    } catch (_: Exception) { "image.jpg" }
-                } else File(srcPath).name
+                val srcUri = Uri.parse(srcPath)
+                val srcName = if (srcUri.scheme == "content") {
+                    val cursor = contentResolver.query(srcUri, arrayOf("_display_name"), null, null, null)
+                    cursor?.use { if (it.moveToFirst()) it.getString(0) ?: "image.jpg" else "image.jpg" }
+                        ?: srcUri.lastPathSegment ?: "image.jpg"
+                } else if (srcUri.scheme == "file") File(srcUri.path!!).name else File(srcPath).name
 
                 when (op) {
                     "复制" -> {
                         if (!mediaStoreCopy(targetFolder, srcPath, srcName))
-                            throw IOException("MediaStore 写入失败")
+                            throw IOException("目标写入失败，原图未更改")
                         "已复制到 ${File(targetFolder).name}"
                     }
                     "移动" -> {
                         if (!mediaStoreCopy(targetFolder, srcPath, srcName))
-                            throw IOException("MediaStore 写入失败")
-                        val deleted = mediaStoreDelete(srcPath)
-                        if (!deleted && srcPath.startsWith("content:")) {
-                            // Copied successfully but can't delete source (no write URI permission)
-                            "无法删除原始图片（无写入权限），但已复制到${File(targetFolder).name}"
-                        } else if (!deleted) {
-                            throw IOException("删除源文件失败")
+                            throw IOException("目标写入失败，原图未更改")
+                        if (!mediaStoreDelete(srcPath)) {
+                            "复制成功，但无法删除原图；移动未完成"
                         } else {
                             "已移动到 ${File(targetFolder).name}"
                         }
@@ -743,12 +825,17 @@ class MainActivity : Activity() {
                     else -> throw IOException("未知操作")
                 }
             } catch (e: Exception) {
-                "${op}失败: ${e.localizedMessage ?: "未知错误"}"
+                "${op}失败: ${e.localizedMessage ?: "未知错误"}；原图未更改"
             }
+            if (isFinishing || isDestroyed) return@execute
             runOnUiThread {
                 toast(result)
-                if (!result.contains("失败")) scan()
-                showPhotoView()
+                if (result.startsWith("已移动到")) {
+                    if (isExternal) finish() else { scan(); showAlbums() }
+                } else {
+                    if (result.startsWith("已复制到") || result.startsWith("复制成功")) scan()
+                    showPhotoView()
+                }
             }
         }
     }
@@ -787,7 +874,7 @@ class MainActivity : Activity() {
                     val projection = arrayOf(MediaStore.Images.Media._ID)
                     val sel = "${MediaStore.Images.Media.DISPLAY_NAME}=? AND ${MediaStore.Images.Media.RELATIVE_PATH}=?"
                     val cursor = contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                        projection, sel, arrayOf(name, dir), null)
+                        projection, sel, arrayOf(name, if (dir.isBlank()) "" else "$dir/"), null)
                     cursor?.use {
                         if (it.moveToFirst())
                             return ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, it.getLong(0))
@@ -802,58 +889,108 @@ class MainActivity : Activity() {
         name.endsWith(".jpg", true) || name.endsWith(".jpeg", true) -> "image/jpeg"
         name.endsWith(".png", true) -> "image/png"
         name.endsWith(".webp", true) -> "image/webp"
+        name.endsWith(".gif", true) -> "image/gif"
         else -> "image/jpeg"
     }
 
-    /** Copy image bytes via MediaStore insert (bypasses ColorOS UID isolation). */
     private fun mediaStoreCopy(albumFolder: String, srcPath: String, fileName: String): Boolean {
-        val folderName = File(albumFolder).name
-        // Read source bytes
-        val data = try {
-            if (srcPath.startsWith("content:"))
-                contentResolver.openInputStream(Uri.parse(srcPath))?.use { it.readBytes() }
-            else File(srcPath).readBytes()
-        } catch (_: Exception) { null } ?: return false
-
-        // Approach: MediaStore insert with RELATIVE_PATH + IS_PENDING
-        try {
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                put(MediaStore.Images.Media.MIME_TYPE, mimeFromName(fileName))
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/$folderName")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            if (uri != null) {
-                contentResolver.openOutputStream(uri)?.use { it.write(data) }
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                contentResolver.update(uri, values, null, null)
+        val relativeFolder = relativeFolderPath(
+            Environment.getExternalStorageDirectory(), File(albumFolder)
+        ) ?: return false
+        val expectedLength = sourceLength(srcPath)
+        val source = openSourceStream(srcPath) ?: return false
+        if (Build.VERSION.SDK_INT >= 29) {
+            var inserted: Uri? = null
+            try {
+                val safeName = uniqueMediaStoreName(relativeFolder, fileName)
+                val values = ContentValues().apply {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, safeName)
+                    put(MediaStore.Images.Media.MIME_TYPE, mimeFromName(safeName))
+                    put(MediaStore.Images.Media.RELATIVE_PATH, relativeFolder)
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+                inserted = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IOException("无法创建目标图片")
+                val output = contentResolver.openOutputStream(inserted, "w")
+                    ?: throw IOException("无法打开目标图片")
+                val copied = source.use { input -> output.use { input.copyTo(it, 64 * 1024) } }
+                if (copied <= 0L || (expectedLength != null && copied != expectedLength))
+                    throw IOException("图片内容长度不匹配")
+                val committed = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                if (contentResolver.update(inserted, committed, null, null) <= 0)
+                    throw IOException("无法提交目标图片")
                 return true
+            } catch (_: Exception) {
+                try { inserted?.let { contentResolver.delete(it, null, null) } } catch (_: Exception) {}
+                try { source.close() } catch (_: Exception) {}
+                return false
             }
-        } catch (_: Exception) {}
-
-        // Fallback: direct file write (works on devices without UID isolation)
-        try {
-            val destDir = File(albumFolder).apply { mkdirs() }
-            val dest = resolveDestName(destDir, fileName)
-            dest.writeBytes(data)
-            return true
-        } catch (_: Exception) {}
-        return false
-    }
-
-    private fun resolveDestName(dir: File, name: String): File {
-        var file = File(dir, name)
-        var n = 1
-        while (file.exists()) {
-            val base = name.substringBeforeLast(".")
-            val ext = name.substringAfterLast(".", "")
-            file = File(dir, "${base}($n).$ext")
-            n++
         }
-        return file
+
+        var tempFile: File? = null
+        return try {
+            val dir = File(albumFolder)
+            if (!dir.isDirectory && !dir.mkdirs()) throw IOException("无法创建目标相册")
+            val destination = resolveDestName(dir, fileName)
+            val temp = File(dir, ".${destination.name}.${System.nanoTime()}.tmp")
+            tempFile = temp
+            val copied = source.use { input ->
+                java.io.FileOutputStream(temp).use { output ->
+                    val count = input.copyTo(output, 64 * 1024)
+                    output.fd.sync()
+                    count
+                }
+            }
+            if (copied <= 0L || temp.length() != copied ||
+                (expectedLength != null && copied != expectedLength) || !temp.renameTo(destination))
+                throw IOException("无法完成图片写入")
+            true
+        } catch (_: Exception) {
+            try { tempFile?.delete() } catch (_: Exception) {}
+            try { source.close() } catch (_: Exception) {}
+            false
+        }
     }
+
+    private fun sourceLength(source: String): Long? = try {
+        val uri = Uri.parse(source)
+        if (uri.scheme == "content") {
+            val cursor = contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+            val length = cursor?.use {
+                val index = it.getColumnIndex(OpenableColumns.SIZE)
+                if (index >= 0 && it.moveToFirst()) it.getLong(index) else -1L
+            } ?: -1L
+            length.takeIf { it >= 0L }
+        } else {
+            val path = if (uri.scheme == "file") uri.path!! else source
+            File(path).takeIf { it.isFile }?.length()
+        }
+    } catch (_: Exception) { null }
+
+    private fun openSourceStream(source: String) = try {
+        val uri = Uri.parse(source)
+        when (uri.scheme) {
+            "file" -> File(uri.path!!).inputStream()
+            null -> File(source).inputStream()
+            else -> contentResolver.openInputStream(uri)
+        }
+    } catch (_: Exception) { null }
+
+    private fun uniqueMediaStoreName(relativeFolder: String, requested: String): String =
+        uniqueFileName(requested) { candidate ->
+            try {
+                val cursor = contentResolver.query(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    arrayOf(MediaStore.Images.Media._ID),
+                    "${MediaStore.Images.Media.DISPLAY_NAME}=? AND ${MediaStore.Images.Media.RELATIVE_PATH}=?",
+                    arrayOf(candidate, relativeFolder), null
+                )
+                cursor?.use { it.moveToFirst() } ?: false
+            } catch (_: Exception) { false }
+        }
+
+    private fun resolveDestName(dir: File, name: String): File =
+        File(dir, uniqueFileName(name) { File(dir, it).exists() })
 
     private fun contentUriToMediaId(contentUri: String): Long? {
         // content://media/external/images/media/123 → 123
@@ -891,17 +1028,22 @@ class MainActivity : Activity() {
             } catch (_: Exception) {}
             // 2c) Try taking write permission then direct delete
             try {
-                try { contentResolver.takePersistableUriPermission(parsed, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) } catch (_: Exception) {}
                 if (contentResolver.delete(parsed, null, null) > 0) return true
             } catch (_: Exception) {}
         }
-        // 3) Last resort: direct file delete + truncate
-        try { if (File(path).delete()) return true } catch (_: Exception) {}
-        try {
-            java.io.RandomAccessFile(path, "rw").use { it.setLength(0) }
-            if (File(path).delete()) return true
-        } catch (_: Exception) {}
-        return false
+        val parsed = Uri.parse(path)
+        val filePath = if (parsed.scheme == "file") parsed.path ?: return false
+            else if (parsed.scheme == null) path else return false
+        if (filePath != path) {
+            val fileUri = fileToMediaUri(filePath)
+            if (fileUri != null) {
+                try { if (contentResolver.delete(fileUri, null, null) > 0) return true } catch (_: Exception) {}
+            }
+        }
+        return try {
+            val file = File(filePath)
+            file.isFile && file.delete()
+        } catch (_: Exception) { false }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -990,8 +1132,9 @@ class MainActivity : Activity() {
     // ══════════════════════════════════════════════════════════════════
 
     private fun currentUri(): Uri {
-        val p = viewerPics[viewerIndex].path
-        return if (p.startsWith("content:")) Uri.parse(p) else Uri.fromFile(File(p))
+        val path = viewerPics[viewerIndex].path
+        val parsed = Uri.parse(path)
+        return if (parsed.scheme != null) parsed else Uri.fromFile(File(path))
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1015,13 +1158,14 @@ class MainActivity : Activity() {
             .setNegativeButton("取消", null)
             .setPositiveButton("删除") { _, _ ->
                 val p = viewerPics[viewerIndex].path
-                io.execute {
+                fileIo.execute {
                     val ok = mediaStoreDelete(p)
+                    if (isFinishing || isDestroyed) return@execute
                     runOnUiThread {
-                        if (ok) { toast("已删除")
-                            if (isExternal) finish()
-                            else { scan(); showAlbums() }
-                        } else toast("删除失败")
+                        if (ok) {
+                            toast("已删除")
+                            if (isExternal) finish() else { scan(); showAlbums() }
+                        } else toast("删除失败，原图未修改")
                     }
                 }
             }.show()
@@ -1033,6 +1177,7 @@ class MainActivity : Activity() {
 
     private var crownDelta = 0f
     private var crownSwitchMs = 0L
+    @SuppressLint("InlinedApi")
     override fun dispatchGenericMotionEvent(e: MotionEvent): Boolean {
         if (e.action == MotionEvent.ACTION_SCROLL) {
             var delta = e.getAxisValue(MotionEvent.AXIS_VSCROLL)
@@ -1067,7 +1212,7 @@ class MainActivity : Activity() {
                     }
                 } else {
                     when (page) {
-                        Page.ALBUMS -> albumScroll?.scrollBy(0, step)
+                        Page.ALBUMS -> albumGrid?.scrollBy(0, step)
                         Page.SETTINGS -> settingsScroll?.scrollBy(0, step)
                         Page.PICK_ALBUM -> pickerScroll?.scrollBy(0, step)
                         Page.SELECT_ALBUMS -> selectScroll?.scrollBy(0, step)
@@ -1097,16 +1242,18 @@ class MainActivity : Activity() {
             setBackgroundColor(if (dark) Color.rgb(44, 48, 49) else Color.rgb(225, 231, 231))
             tag = "cover_$folder"
         }
-        // Load cover from cache or decode on IO thread
         if (coverPath != null) {
-            synchronized(coverCache) {
-                coverCache[coverPath]?.let { cover.setImageBitmap(it); return@let }
-            }
-            io.execute {
-                val b = decodeSampled(coverPath, 180, 180)
-                if (b != null) synchronized(coverCache) { coverCache[coverPath] = b }
-                runOnUiThread {
-                    if (cover.tag == "cover_$folder") cover.setImageBitmap(b)
+            val cached = synchronized(coverCache) { coverCache[coverPath] }
+            if (cached != null) {
+                cover.setImageBitmap(cached)
+            } else {
+                coverIo.execute {
+                    val bitmap = decodeSampled(coverPath, 180, 180)
+                    if (bitmap != null) synchronized(coverCache) { coverCache[coverPath] = bitmap }
+                    if (isFinishing || isDestroyed) return@execute
+                    runOnUiThread {
+                        if (cover.tag == "cover_$folder") cover.setImageBitmap(bitmap)
+                    }
                 }
             }
         }
@@ -1121,12 +1268,6 @@ class MainActivity : Activity() {
             else toast("这个相册还是空的")
         }
         return card
-    }
-
-    private fun gridParams() = GridLayout.LayoutParams().apply {
-        width = 0; height = dp(100)
-        columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
-        setMargins(dp(3), dp(3), dp(3), dp(3))
     }
 
     private fun settingCard(title: String, subtitle: String, action: () -> Unit): View {
@@ -1204,7 +1345,7 @@ class MainActivity : Activity() {
                 if (!dir.mkdirs())
                     return@setPositiveButton toast(if (dir.exists()) "相册已存在" else "创建失败")
                 try {
-                    resources.openRawResource(R.drawable.minipic_gallery_signature).use { ins ->
+                    resources.openRawResource(R.raw.minipic_gallery_signature).use { ins ->
                         File(dir, SIGNATURE).outputStream().use { ins.copyTo(it) }
                     }
                 } catch (_: Exception) {}
@@ -1218,36 +1359,58 @@ class MainActivity : Activity() {
         if (bold) setTypeface(typeface, Typeface.BOLD)
     }
 
-    private fun decodeUri(uri: Uri): Bitmap? = try {
-        if (uri.scheme == "file") decodeSampled(uri.path!!, 1000, 1000)
-        else contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
-    } catch (_: Exception) { null }
-
-    /** Decode a drawable — returns animated drawable for GIFs (API 28+). */
-    private fun decodeDrawable(uri: Uri): Drawable? = try {
+    private fun decodeDrawable(uri: Uri, maxWidth: Int, maxHeight: Int): Drawable? = try {
         if (Build.VERSION.SDK_INT >= 28) {
-            val source = when {
-                uri.scheme == "file" -> ImageDecoder.createSource(File(uri.path!!))
-                else -> ImageDecoder.createSource(contentResolver, uri)
-            }
-            ImageDecoder.decodeDrawable(source) { decoder, _, _ ->
+            val source = if (uri.scheme == "file")
+                ImageDecoder.createSource(File(uri.path!!))
+            else ImageDecoder.createSource(contentResolver, uri)
+            ImageDecoder.decodeDrawable(source) { decoder, info, _ ->
+                val width = info.size.width.coerceAtLeast(1)
+                val height = info.size.height.coerceAtLeast(1)
+                val sample = minOf(1f, maxWidth.toFloat() / width, maxHeight.toFloat() / height)
+                if (sample < 1f) {
+                    decoder.setTargetSize(max(1, (width * sample).roundToInt()),
+                        max(1, (height * sample).roundToInt()))
+                }
                 decoder.isMutableRequired = false
             }
         } else {
-            // API 23-27 fallback: decode as static bitmap
-            decodeUri(uri)?.let { BitmapDrawable(resources, it) }
+            decodeSampled(uri, maxWidth, maxHeight)?.let { BitmapDrawable(resources, it) }
         }
     } catch (_: Exception) { null }
 
-    private fun decodeSampled(path: String, width: Int, height: Int): Bitmap? {
+    private fun openImageStream(uri: Uri) = try {
+        if (uri.scheme == "file") {
+            val path = uri.path
+            if (path == null) null else {
+                val file = File(path)
+                if (!file.isFile || !file.canRead()) null else file.inputStream()
+            }
+        } else {
+            contentResolver.openInputStream(uri)
+        }
+    } catch (_: Exception) { null }
+
+    private fun decodeSampled(uri: Uri, width: Int, height: Int): Bitmap? = try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(path, bounds)
-        var sample = 1
-        while (bounds.outWidth / sample > width * 2 || bounds.outHeight / sample > height * 2) sample *= 2
-        return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply {
-            inSampleSize = sample; inPreferredConfig = Bitmap.Config.RGB_565
-        })
-    }
+        openImageStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) null else {
+            val targetScale = minOf(
+                width.toFloat() / bounds.outWidth,
+                height.toFloat() / bounds.outHeight
+            )
+            var sample = 1
+            while (1f / (sample * 2) >= targetScale) sample *= 2
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            openImageStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+        }
+    } catch (_: Throwable) { null }
+
+    private fun decodeSampled(path: String, width: Int, height: Int): Bitmap? =
+        decodeSampled(Uri.fromFile(File(path)), width, height)
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
     private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
@@ -1255,7 +1418,11 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        try { io.shutdownNow() } catch (_: Exception) {}
+        imageLoadGeneration++
+        io.shutdownNow()
+        fileIo.shutdownNow()
+        coverIo.shutdownNow()
+        synchronized(coverCache) { coverCache.clear() }
     }
 }
 
@@ -1296,11 +1463,17 @@ class GestureFrameLayout(context: Context) : FrameLayout(context) {
         return false
     }
 
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_UP) {
             val dx = event.x - downX
             val fromLeft = downX < edgeThresh
             swipeObserver?.invoke(dx, fromLeft)
+            performClick()
         }
         return true
     }
@@ -1325,26 +1498,46 @@ class PhotoView(context: Context) : View(context) {
     })
 
     fun setDrawable(value: Drawable?) {
-        drawable = value; userScale = 1f; tx = 0f; ty = 0f
-        if (value != null) {
-            fitScale = if (width > 0 && height > 0 && value.intrinsicWidth > 0 && value.intrinsicHeight > 0)
-                min(width.toFloat() / value.intrinsicWidth, height.toFloat() / value.intrinsicHeight) else 1f
+        drawable = value
+        userScale = 1f
+        tx = 0f
+        ty = 0f
+        updateFitScale()
+        invalidate()
+    }
+
+    private fun updateFitScale() {
+        val current = drawable ?: return
+        if (width > 0 && height > 0 && current.intrinsicWidth > 0 && current.intrinsicHeight > 0) {
+            fitScale = min(width.toFloat() / current.intrinsicWidth, height.toFloat() / current.intrinsicHeight)
+            clamp()
         }
-        requestLayout(); invalidate()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        updateFitScale()
     }
     fun isAtFitScale() = userScale <= 1.015f
     fun zoomBy(delta: Float) {
         userScale = (userScale * exp(delta * .055f)).coerceIn(.1f, 20f); clamp(); invalidate()
     }
     override fun onDraw(c: Canvas) {
-        super.onDraw(c); val d = drawable ?: return
+        super.onDraw(c)
+        val d = drawable ?: return
+        updateFitScale()
         val s = fitScale * userScale
-        if (width > 0 && height > 0 && d.intrinsicWidth > 0 && d.intrinsicHeight > 0)
-            fitScale = min(width.toFloat() / d.intrinsicWidth, height.toFloat() / d.intrinsicHeight)
-        c.save(); c.translate(width / 2f + tx, height / 2f + ty); c.scale(s, s)
+        c.save()
+        c.translate(width / 2f + tx, height / 2f + ty)
+        c.scale(s, s)
         d.setBounds(-d.intrinsicWidth / 2, -d.intrinsicHeight / 2, d.intrinsicWidth / 2, d.intrinsicHeight / 2)
         d.draw(c); c.restore()
     }
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
         scaleDetector.onTouchEvent(e)
         when (e.actionMasked) {
@@ -1352,7 +1545,8 @@ class PhotoView(context: Context) : View(context) {
             MotionEvent.ACTION_MOVE -> if (dragging && !scaleDetector.isInProgress) {
                 tx += e.x - lastX; ty += e.y - lastY; lastX = e.x; lastY = e.y; clamp(); invalidate()
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> dragging = false
+            MotionEvent.ACTION_UP -> { dragging = false; performClick() }
+            MotionEvent.ACTION_CANCEL -> dragging = false
         }
         return true
     }
