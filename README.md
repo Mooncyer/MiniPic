@@ -69,6 +69,7 @@ Release 构建使用仓库外的签名文件，不把密码或 keystore 放进 G
 - `app-armeabi-v7a-release.apk`
 - `app-arm64-v8a-release.apk`
 
+当前应用及依赖没有 native `.so`，因此 armeabi-v7a 与 Universal APK 当前大小相同；单 ABI 包仍按要求提供，主要用于 ABI 兼容性和分发选择，而不是当前包体缩减。
 Release 构建如果找不到签名配置会回退为 unsigned；交付前必须用 `apksigner verify --verbose --print-certs` 检查证书指纹。
 
 漫画测试素材 `142347535-[Dai3] 测谎仪检查.zip` 已导入 OWW211 到 `Pictures/MiniPicMangaTest/`，便于直接查看。旧 APK/快照 ZIP 和测试 ZIP 位于 `archive/`，仅为本机归档，不代表当前发布包；`.gitignore` 默认忽略 APK/ZIP，因此不会自动进入 Git。
