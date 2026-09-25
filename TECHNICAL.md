@@ -1,7 +1,7 @@
 # MiniPic 技术说明
 
 > 更新：2026-09-25
-> 当前版本：0.0.3（versionCode 3）
+> 当前版本：0.0.4（versionCode 4）
 > 项目根目录：当前工作区；Android 工程位于 `android/`
 
 ## 技术基线
@@ -44,9 +44,10 @@ android/app/src/test/java/mini/pic/GalleryModelTest.kt
 
 ## 图片查看与文件操作
 
-- API 28+ 使用 `ImageDecoder`；在解码回调中把目标图像限制在显示尺寸约 2 倍内。API 23–27 先读 bounds，再用 `inSampleSize` 解码静态 Bitmap。
-- `content://` URI 直接异步解码，不会在主线程整图复制到缓存。`file://` 和本地路径都走对应的文件输入流。
-- PhotoView 负责 fit-center、缩放、平移和边界限制；表冠由 Activity 的 `dispatchGenericMotionEvent` 读取 VSCROLL/SCROLL/HSCROLL 后分发。
+- 静态图预览限制在约一倍屏幕尺寸；放大超过阈值后，PhotoView 根据固定原图坐标计算可视区域，带 25% overscan 用 `BitmapRegionDecoder` 解码并把 tile 叠加回原图坐标。
+- Region 采样使用 2 次幂倍率，按当前区域像素预算选择尽可能小的 sample；单 tile 上限约 4MP。缩放/拖动通过 90ms 去抖和单线程查看器队列只保留最新请求，预览/上一 tile 在新 tile 到达前继续绘制。
+- EXIF 方向使用统一 raw/oriented 坐标映射；API 23-27 的预览额外应用方向变换。GIF/动画 WebP 检测为 Animatable 后保留动画预览，不叠静态区域，避免 tile 与动图帧错位。
+- 表冠 VSCROLL/SCROLL/HSCROLL 读到原始 delta 后统一乘 `CROWN_SENSITIVITY=0.4`，页面滚动、图像缩放和翻图累计共用该值；列表滚动累积小数像素余量。
 - 复制通过流式 I/O 写入 MediaStore `IS_PENDING` 项，使用完整 `RELATIVE_PATH`，处理重名后才提交。失败时清理目标项并保留源图。
 - 移动按“复制并提交目标 → 删除源文件”执行。无法删除源 URI 时不谎报移动成功，提示复制已完成但移动未完成。
 - 删除失败不会截断或覆盖源文件。MediaStore/URI 授权失败会返回失败状态；可恢复的系统删除授权流程仍需设备端实测后补齐。
@@ -69,14 +70,13 @@ $env:ANDROID_SDK_ROOT='E:\Data\Android'
 
 最近一次全量验证：JVM 单测通过，Debug、Lint、Release 构建成功。Lint 当前 0 errors、6 warnings；警告主要是权限商店政策、target SDK 提示、固定竖屏、备份属性和重复图标密度资源。Release 未配置正式签名；构建成功不代表可直接发布。
 
-自动化测试覆盖扫描分组/隐藏目录/签名目录、相同数量下的内容替换、嵌套相对目录和重名规则。OWW211 实机已通过主页、设置/返回、相册查看、操作页和外部 file URI 查看；隔离目录复制与移动前后 SHA-256 验证一致，移动后源删除成功。曾由缓存中的已删除测试截图触发封面解码崩溃，已增加不存在文件/URI 的安全解码处理并重复验收选择页无 crash。删除没有对用户图片执行实机确认。
-
-设备测得真实图库首页约 47.1 MB PSS / 73.7 MB RSS；选择器和测试操作过程观测到约 62.7 MB PSS / 83.8 MB RSS。ADB 注入期间的 gfxinfo 记录为 54 帧中 38 帧 janky、P95 650ms，该样本混入冷启动、全盘扫描和自动化注入，不能代表稳态性能。实体 REL_WHEEL 表冠、权限拒绝回退、大图/GIF 压力和稳态帧时仍需手动/压力验收。
+自动化测试覆盖扫描分组/隐藏目录/签名目录、相同数量下的内容替换、嵌套相对目录、重名规则、表冠 0.4 换算、区域解码像素预算和 EXIF 八方向映射。9 项 JVM 测试均通过。
+0.0.4 在 OWW211/API 30 上可正常安装并打开约 7.8 MB JPEG；冷启动查看器约 38.9 MB PSS / 64.7 MB RSS，最终返回主页后约 46.6 MB PSS / 73.3 MB RSS，无 crash。该 JPEG 的内容本身是缩放后仍显得像素化的素材；ADB `input roll` 未触发标准 ACTION_SCROLL，且系统拒绝对触摸 event 节点执行 `sendevent`，因此本轮不能声称已实测 pinch 后区域细节。需用户在手表上实际放大并确认 tile 清晰度、EXIF 旋转和高倍率内存。
 
 ## 尚需验收与后续工程工作
 
-1. 手动验证 OWW211 实体表冠方向/灵敏度和权限拒绝回退。
-2. 在大图/GIF 与稳态滚动下记录耗时、帧时及峰值 PSS/RSS。
-3. 按图库规模测量全盘扫描后，再决定是否引入 SQLite/增量索引。
-4. 将相册选择器/主页筛选从一次性 View 列表改为可回收列表。
-5. 按职责继续从 MainActivity 抽出文件操作、图片查看器和表冠分发模块。
+1. 手动验证 OWW211 实体表冠约 40% 灵敏度、方向和快慢滚动。
+2. 实际放大高清静态图，确认区域 tile 清晰度、平移覆盖与 EXIF 方向；记录峰值 PSS/RSS 和滚动帧时。
+3. 核对 GIF/动画 WebP 继续动画但保持预览分辨率的预期行为。
+4. 完成权限拒绝/URI 写授权和删除流程的端到端测试。
+5. 按图库压力数据评估增量索引、回收选择器和 Activity 模块拆分。

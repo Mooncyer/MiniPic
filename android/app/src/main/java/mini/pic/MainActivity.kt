@@ -12,6 +12,8 @@ import android.graphics.drawable.Drawable
 import android.net.Uri
 import android.os.*
 import android.provider.DocumentsContract
+import androidx.exifinterface.media.ExifInterface
+import java.io.InputStream
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
@@ -32,6 +34,21 @@ import java.util.concurrent.Executors
 import kotlin.math.*
 
 private const val SIGNATURE = GALLERY_SIGNATURE
+private const val CROWN_SENSITIVITY = 0.4f
+private const val REGION_OVERSCAN = 1.25f
+private const val REGION_PIXEL_BUDGET = 4_000_000
+
+data class DetailRequest(
+    val token: Long,
+    val sourceRect: Rect,
+    val sample: Int
+)
+
+data class ImageMetadata(
+    val width: Int,
+    val height: Int,
+    val orientation: Int = ExifInterface.ORIENTATION_NORMAL
+)
 
 enum class Page { ALBUMS, SETTINGS, VIEWER, ACTIONS, PICK_ALBUM, SELECT_ALBUMS }
 
@@ -42,6 +59,7 @@ class MainActivity : Activity() {
     private val io = Executors.newSingleThreadExecutor()
     private val fileIo = Executors.newSingleThreadExecutor()
     private val coverIo = Executors.newFixedThreadPool(2)
+    private val viewerIo = Executors.newSingleThreadExecutor()
     private val coverCache = object : LinkedHashMap<String, Bitmap>(32, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>): Boolean = size > 24
     }
@@ -503,11 +521,16 @@ class MainActivity : Activity() {
         newHost.addView(newPhoto, FrameLayout.LayoutParams(-1, -1))
 
         val generation = ++imageLoadGeneration
+        detailRequestGeneration++
+        detailRequestFuture?.cancel(true)
+        detailRequestFuture = null
+        detailRequestHandler.removeCallbacksAndMessages(null)
         val uri = currentUri()
         val rotationForLoad = rotation
-        coverIo.execute {
-            val drawable = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels * 2),
-                max(1, resources.displayMetrics.heightPixels * 2))
+        viewerIo.execute {
+            val metadata = readImageMetadata(uri)
+            val drawable = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels),
+                max(1, resources.displayMetrics.heightPixels), metadata.orientation)
             if (isFinishing || isDestroyed) return@execute
             runOnUiThread {
                 if (generation != imageLoadGeneration || page != Page.VIEWER || isFinishing || isDestroyed) {
@@ -515,9 +538,7 @@ class MainActivity : Activity() {
                     return@runOnUiThread
                 }
                 if (drawable == null) { animating = false; return@runOnUiThread }
-                newPhoto.setDrawable(drawable)
-                newPhoto.rotation = rotationForLoad
-                (drawable as? Animatable)?.start()
+                bindViewerImage(newPhoto, uri, metadata, drawable, rotationForLoad)
 
                 // New starts from the opposite side and slides into view
                 newHost.translationY = -direction * h
@@ -668,6 +689,10 @@ class MainActivity : Activity() {
     }
 
     private var imageLoadGeneration = 0L
+    private var detailRequestGeneration = 0L
+    private var detailRequestFuture: java.util.concurrent.Future<*>? = null
+    private val detailRequestHandler = Handler(Looper.getMainLooper())
+    private var detailRequestRunnable: Runnable? = null
 
     private fun buildViewerPage(): View {
         page = Page.VIEWER
@@ -677,20 +702,102 @@ class MainActivity : Activity() {
         viewer = photo
         host.addView(photo, FrameLayout.LayoutParams(-1, -1))
         val generation = ++imageLoadGeneration
+        detailRequestGeneration++
+        detailRequestFuture?.cancel(true)
+        detailRequestFuture = null
+        detailRequestHandler.removeCallbacksAndMessages(null)
         val uri = currentUri()
         val rotationForLoad = rotation
-        coverIo.execute {
-            val drawable = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels * 2),
-                max(1, resources.displayMetrics.heightPixels * 2))
+        viewerIo.execute {
+            val metadata = readImageMetadata(uri)
+            val preview = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels),
+                max(1, resources.displayMetrics.heightPixels), metadata.orientation)
             if (isFinishing || isDestroyed) return@execute
             runOnUiThread {
                 if (generation != imageLoadGeneration || isFinishing || isDestroyed) return@runOnUiThread
-                photo.setDrawable(drawable)
-                photo.rotation = rotationForLoad
-                (drawable as? Animatable)?.start()
+                bindViewerImage(photo, uri, metadata, preview, rotationForLoad)
             }
         }
         return host
+    }
+
+    private fun bindViewerImage(photo: PhotoView, uri: Uri, metadata: ImageMetadata, drawable: Drawable?, rotationForLoad: Float) {
+        val supportsRegionDetail = drawable !is Animatable
+        photo.setImageSource(metadata.width, metadata.height, metadata.orientation, supportsRegionDetail)
+        photo.setDrawable(drawable)
+        photo.rotation = rotationForLoad
+        photo.onViewportChanged = if (supportsRegionDetail) {
+            { request -> requestDetailRegion(photo, uri, request) }
+        } else null
+        if (supportsRegionDetail) photo.requestDetailUpdate()
+        (drawable as? Animatable)?.start()
+    }
+
+    private fun readImageMetadata(uri: Uri): ImageMetadata {
+        return try {
+            openImageStream(uri)?.use { input ->
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeStream(input, null, bounds)
+                val orientation = openImageStream(uri)?.use { stream ->
+                    ExifInterface(stream).getAttributeInt(
+                        ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
+                    )
+                } ?: ExifInterface.ORIENTATION_NORMAL
+                ImageMetadata(bounds.outWidth.coerceAtLeast(1), bounds.outHeight.coerceAtLeast(1), orientation)
+            } ?: ImageMetadata(1, 1)
+        } catch (_: Exception) { ImageMetadata(1, 1) }
+    }
+    private fun requestDetailRegion(photo: PhotoView, uri: Uri, request: DetailRequest) {
+        if (photo.hasDetailFor(request)) return
+        detailRequestGeneration++
+        val generation = detailRequestGeneration
+        detailRequestRunnable?.let(detailRequestHandler::removeCallbacks)
+        detailRequestFuture?.cancel(true)
+        val task = Runnable {
+            detailRequestFuture = viewerIo.submit {
+                val bitmap = decodeRegion(uri, request.sourceRect, request.sample)
+                if (bitmap == null) return@submit
+                if (isFinishing || isDestroyed) {
+                    bitmap.recycle()
+                    return@submit
+                }
+                runOnUiThread {
+                    if (generation != detailRequestGeneration || photo !== viewer || isFinishing || isDestroyed) {
+                        if (!bitmap.isRecycled) bitmap.recycle()
+                        return@runOnUiThread
+                    }
+                    photo.setDetailBitmap(bitmap, request.sourceRect, request.sample)
+                }
+            }
+        }
+        detailRequestRunnable = task
+        detailRequestHandler.postDelayed(task, 90L)
+    }
+
+    private fun decodeRegion(uri: Uri, requested: Rect, sample: Int): Bitmap? {
+        val stream = openImageStream(uri) ?: return null
+        var decoder: BitmapRegionDecoder? = null
+        return try {
+            decoder = BitmapRegionDecoder.newInstance(stream, false)
+            val current = decoder ?: return null
+            val source = Rect(
+                requested.left.coerceIn(0, current.width - 1),
+                requested.top.coerceIn(0, current.height - 1),
+                requested.right.coerceIn(1, current.width),
+                requested.bottom.coerceIn(1, current.height)
+            )
+            if (source.width() <= 0 || source.height() <= 0) null else {
+                val options = BitmapFactory.Options().apply {
+                    inSampleSize = sample.coerceAtLeast(1)
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+                current.decodeRegion(source, options)
+            }
+        } catch (_: Exception) { null }
+        finally {
+            try { decoder?.recycle() } catch (_: Exception) {}
+            try { stream.close() } catch (_: Exception) {}
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1177,6 +1284,7 @@ class MainActivity : Activity() {
 
     private var crownDelta = 0f
     private var crownSwitchMs = 0L
+    private var crownScrollRemainder = 0f
     @SuppressLint("InlinedApi")
     override fun dispatchGenericMotionEvent(e: MotionEvent): Boolean {
         if (e.action == MotionEvent.ACTION_SCROLL) {
@@ -1184,7 +1292,7 @@ class MainActivity : Activity() {
             if (delta == 0f) delta = e.getAxisValue(MotionEvent.AXIS_SCROLL)
             if (delta == 0f) delta = e.getAxisValue(MotionEvent.AXIS_HSCROLL)
             if (delta != 0f) {
-                val step = (-delta * dp(3)).roundToInt()
+                delta = scaleCrownDelta(delta, CROWN_SENSITIVITY)
                 if (page == Page.VIEWER) {
                     if (prefs.getBoolean("crownZoom", true)) {
                         viewer?.zoomBy(-delta)
@@ -1211,6 +1319,9 @@ class MainActivity : Activity() {
                         }
                     }
                 } else {
+                    val pixels = -delta * dp(3f) + crownScrollRemainder
+                    val step = pixels.toInt()
+                    crownScrollRemainder = pixels - step
                     when (page) {
                         Page.ALBUMS -> albumGrid?.scrollBy(0, step)
                         Page.SETTINGS -> settingsScroll?.scrollBy(0, step)
@@ -1359,7 +1470,7 @@ class MainActivity : Activity() {
         if (bold) setTypeface(typeface, Typeface.BOLD)
     }
 
-    private fun decodeDrawable(uri: Uri, maxWidth: Int, maxHeight: Int): Drawable? = try {
+    private fun decodeDrawable(uri: Uri, maxWidth: Int, maxHeight: Int, orientation: Int): Drawable? = try {
         if (Build.VERSION.SDK_INT >= 28) {
             val source = if (uri.scheme == "file")
                 ImageDecoder.createSource(File(uri.path!!))
@@ -1367,17 +1478,43 @@ class MainActivity : Activity() {
             ImageDecoder.decodeDrawable(source) { decoder, info, _ ->
                 val width = info.size.width.coerceAtLeast(1)
                 val height = info.size.height.coerceAtLeast(1)
-                val sample = minOf(1f, maxWidth.toFloat() / width, maxHeight.toFloat() / height)
-                if (sample < 1f) {
-                    decoder.setTargetSize(max(1, (width * sample).roundToInt()),
-                        max(1, (height * sample).roundToInt()))
+                val factor = minOf(1f, maxWidth.toFloat() / width, maxHeight.toFloat() / height)
+                if (factor < 1f) {
+                    decoder.setTargetSize(max(1, (width * factor).roundToInt()),
+                        max(1, (height * factor).roundToInt()))
                 }
                 decoder.isMutableRequired = false
             }
         } else {
-            decodeSampled(uri, maxWidth, maxHeight)?.let { BitmapDrawable(resources, it) }
+            decodeLegacyPreview(uri, maxWidth, maxHeight, orientation)
         }
     } catch (_: Exception) { null }
+
+    private fun decodeLegacyPreview(uri: Uri, width: Int, height: Int, orientation: Int): Drawable? {
+        val bitmap = decodeSampled(uri, width, height) ?: return null
+        if (orientation == ExifInterface.ORIENTATION_NORMAL) return BitmapDrawable(resources, bitmap)
+        val oriented = orientedSize(bitmap.width, bitmap.height, orientation)
+        val sourcePoints = floatArrayOf(
+            0f, 0f, bitmap.width.toFloat(), 0f,
+            bitmap.width.toFloat(), bitmap.height.toFloat(), 0f, bitmap.height.toFloat()
+        )
+        val rawCorners = sourcePoints.copyOf()
+        val targetPoints = FloatArray(8)
+        for (i in 0 until 4) {
+            val point = mapRawPointToOriented(
+                rawCorners[i * 2], rawCorners[i * 2 + 1], bitmap.width.toFloat(), bitmap.height.toFloat(), orientation
+            )
+            targetPoints[i * 2] = point.first
+            targetPoints[i * 2 + 1] = point.second
+        }
+        val transform = Matrix()
+        if (!transform.setPolyToPoly(sourcePoints, 0, targetPoints, 0, 4))
+            return BitmapDrawable(resources, bitmap)
+        val output = Bitmap.createBitmap(oriented.first, oriented.second, Bitmap.Config.ARGB_8888)
+        Canvas(output).drawBitmap(bitmap, transform, Paint(Paint.FILTER_BITMAP_FLAG))
+        bitmap.recycle()
+        return BitmapDrawable(resources, output)
+    }
 
     private fun openImageStream(uri: Uri) = try {
         if (uri.scheme == "file") {
@@ -1418,10 +1555,14 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        detailRequestGeneration++
+        detailRequestFuture?.cancel(true)
+        detailRequestHandler.removeCallbacksAndMessages(null)
         imageLoadGeneration++
         io.shutdownNow()
         fileIo.shutdownNow()
         coverIo.shutdownNow()
+        viewerIo.shutdownNow()
         synchronized(coverCache) { coverCache.clear() }
     }
 }
@@ -1485,31 +1626,80 @@ class GestureFrameLayout(context: Context) : FrameLayout(context) {
 
 class PhotoView(context: Context) : View(context) {
     private var drawable: Drawable? = null
+    private var detailBitmap: Bitmap? = null
+    private var detailSource = Rect()
+    private var detailSample = Int.MAX_VALUE
+    private var sourceWidth = 1
+    private var sourceHeight = 1
+    private var rawWidth = 1
+    private var rawHeight = 1
+    private var sourceOrientation = ExifInterface.ORIENTATION_NORMAL
+    private var detailEnabled = false
     private var fitScale = 1f
     private var userScale = 1f
-    private var tx = 0f; private var ty = 0f
-    private var lastX = 0f; private var lastY = 0f
+    private var tx = 0f
+    private var ty = 0f
+    private var lastX = 0f
+    private var lastY = 0f
     private var dragging = false
+    private var detailToken = 0L
+
+    var onViewportChanged: ((DetailRequest) -> Unit)? = null
+
     private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
         override fun onScale(detector: ScaleGestureDetector): Boolean {
-            userScale = (userScale * detector.scaleFactor).coerceIn(.1f, 20f); clamp(); invalidate()
+            userScale = (userScale * detector.scaleFactor).coerceIn(.1f, 20f)
+            clamp()
+            invalidate()
+            requestDetailUpdate()
             return true
         }
     })
+
+    fun setImageSource(width: Int, height: Int, orientation: Int, enableDetail: Boolean) {
+        sourceOrientation = orientation
+        rawWidth = width.coerceAtLeast(1)
+        rawHeight = height.coerceAtLeast(1)
+        val oriented = orientedSize(rawWidth, rawHeight, orientation)
+        sourceWidth = oriented.first.coerceAtLeast(1)
+        sourceHeight = oriented.second.coerceAtLeast(1)
+        detailEnabled = enableDetail
+        updateFitScale()
+    }
 
     fun setDrawable(value: Drawable?) {
         drawable = value
         userScale = 1f
         tx = 0f
         ty = 0f
+        clearDetailBitmap()
         updateFitScale()
         invalidate()
     }
 
+    fun hasDetailFor(request: DetailRequest): Boolean =
+        detailBitmap != null && detailSample <= request.sample &&
+            detailSource.left <= request.sourceRect.left && detailSource.top <= request.sourceRect.top &&
+            detailSource.right >= request.sourceRect.right && detailSource.bottom >= request.sourceRect.bottom
+
+    fun setDetailBitmap(value: Bitmap, sourceRect: Rect, sample: Int) {
+        clearDetailBitmap()
+        detailBitmap = value
+        detailSource = Rect(sourceRect)
+        detailSample = sample.coerceAtLeast(1)
+        invalidate()
+    }
+
+    private fun clearDetailBitmap() {
+        detailBitmap?.let { if (!it.isRecycled) it.recycle() }
+        detailBitmap = null
+        detailSource.setEmpty()
+        detailSample = Int.MAX_VALUE
+    }
+
     private fun updateFitScale() {
-        val current = drawable ?: return
-        if (width > 0 && height > 0 && current.intrinsicWidth > 0 && current.intrinsicHeight > 0) {
-            fitScale = min(width.toFloat() / current.intrinsicWidth, height.toFloat() / current.intrinsicHeight)
+        if (width > 0 && height > 0 && sourceWidth > 0 && sourceHeight > 0) {
+            fitScale = min(width.toFloat() / sourceWidth, height.toFloat() / sourceHeight)
             clamp()
         }
     }
@@ -1517,43 +1707,135 @@ class PhotoView(context: Context) : View(context) {
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         updateFitScale()
+        requestDetailUpdate()
     }
+
     fun isAtFitScale() = userScale <= 1.015f
+
     fun zoomBy(delta: Float) {
-        userScale = (userScale * exp(delta * .055f)).coerceIn(.1f, 20f); clamp(); invalidate()
+        userScale = (userScale * exp(delta * .055f)).coerceIn(.1f, 20f)
+        clamp()
+        invalidate()
+        requestDetailUpdate()
     }
-    override fun onDraw(c: Canvas) {
-        super.onDraw(c)
-        val d = drawable ?: return
+
+    fun requestDetailUpdate() {
+        if (!detailEnabled || sourceWidth <= 1 || sourceHeight <= 1 || width <= 0 || height <= 0) return
+        if (userScale <= 1.12f) {
+            if (detailBitmap != null) {
+                clearDetailBitmap()
+                invalidate()
+            }
+            return
+        }
+        val totalScale = (fitScale * userScale).coerceAtLeast(.0001f)
+        val viewportWidth = width / totalScale
+        val viewportHeight = height / totalScale
+        val centerX = sourceWidth / 2f - tx / totalScale
+        val centerY = sourceHeight / 2f - ty / totalScale
+        val overscanWidth = viewportWidth * REGION_OVERSCAN
+        val overscanHeight = viewportHeight * REGION_OVERSCAN
+        val displayRect = ImageRect(
+            (centerX - overscanWidth / 2f).roundToInt().coerceIn(0, sourceWidth - 1),
+            (centerY - overscanHeight / 2f).roundToInt().coerceIn(0, sourceHeight - 1),
+            (centerX + overscanWidth / 2f).roundToInt().coerceIn(1, sourceWidth),
+            (centerY + overscanHeight / 2f).roundToInt().coerceIn(1, sourceHeight)
+        )
+        if (displayRect.width <= 0 || displayRect.height <= 0) return
+        val rawRectModel = orientedRectToRaw(displayRect, rawWidth, rawHeight, sourceOrientation)
+        val rawRect = Rect(
+            rawRectModel.left.coerceIn(0, rawWidth - 1),
+            rawRectModel.top.coerceIn(0, rawHeight - 1),
+            rawRectModel.right.coerceIn(1, rawWidth),
+            rawRectModel.bottom.coerceIn(1, rawHeight)
+        )
+        val sample = gallerySampleSize(rawRect.width(), rawRect.height(), REGION_PIXEL_BUDGET)
+        val request = DetailRequest(++detailToken, rawRect, sample)
+        if (!hasDetailFor(request)) onViewportChanged?.invoke(request)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
         updateFitScale()
-        val s = fitScale * userScale
-        c.save()
-        c.translate(width / 2f + tx, height / 2f + ty)
-        c.scale(s, s)
-        d.setBounds(-d.intrinsicWidth / 2, -d.intrinsicHeight / 2, d.intrinsicWidth / 2, d.intrinsicHeight / 2)
-        d.draw(c); c.restore()
+        canvas.save()
+        canvas.translate(width / 2f + tx, height / 2f + ty)
+        canvas.scale(fitScale * userScale, fitScale * userScale)
+        drawPreview(canvas)
+        drawDetail(canvas)
+        canvas.restore()
     }
+
+    private fun drawPreview(canvas: Canvas) {
+        val preview = drawable ?: return
+        preview.setBounds(-sourceWidth / 2, -sourceHeight / 2, sourceWidth / 2, sourceHeight / 2)
+        preview.draw(canvas)
+    }
+
+    private fun drawDetail(canvas: Canvas) {
+        val bitmap = detailBitmap ?: return
+        if (detailSource.isEmpty || bitmap.isRecycled) return
+        val srcPoints = floatArrayOf(
+            0f, 0f, bitmap.width.toFloat(), 0f,
+            bitmap.width.toFloat(), bitmap.height.toFloat(), 0f, bitmap.height.toFloat()
+        )
+        val rawPoints = floatArrayOf(
+            detailSource.left.toFloat(), detailSource.top.toFloat(),
+            detailSource.right.toFloat(), detailSource.top.toFloat(),
+            detailSource.right.toFloat(), detailSource.bottom.toFloat(),
+            detailSource.left.toFloat(), detailSource.bottom.toFloat()
+        )
+        val displayPoints = FloatArray(8)
+        for (i in 0 until 4) {
+            val mapped = mapRawPointToOriented(
+                rawPoints[i * 2], rawPoints[i * 2 + 1], rawWidth.toFloat(), rawHeight.toFloat(), sourceOrientation
+            )
+            displayPoints[i * 2] = mapped.first - sourceWidth / 2f
+            displayPoints[i * 2 + 1] = mapped.second - sourceHeight / 2f
+        }
+        val matrix = Matrix()
+        if (matrix.setPolyToPoly(srcPoints, 0, displayPoints, 0, 4)) {
+            canvas.drawBitmap(bitmap, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
+        }
+    }
+
     override fun performClick(): Boolean {
         super.performClick()
         return true
     }
 
-    override fun onTouchEvent(e: MotionEvent): Boolean {
-        scaleDetector.onTouchEvent(e)
-        when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { lastX = e.x; lastY = e.y; dragging = userScale > 1.015f }
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                lastX = event.x
+                lastY = event.y
+                dragging = userScale > 1.015f
+            }
             MotionEvent.ACTION_MOVE -> if (dragging && !scaleDetector.isInProgress) {
-                tx += e.x - lastX; ty += e.y - lastY; lastX = e.x; lastY = e.y; clamp(); invalidate()
+                tx += event.x - lastX
+                ty += event.y - lastY
+                lastX = event.x
+                lastY = event.y
+                clamp()
+                invalidate()
+                requestDetailUpdate()
             }
             MotionEvent.ACTION_UP -> { dragging = false; performClick() }
             MotionEvent.ACTION_CANCEL -> dragging = false
         }
         return true
     }
+
     private fun clamp() {
-        val d = drawable ?: return; val s = fitScale * userScale
-        val maxX = max(0f, (d.intrinsicWidth * s - width) / 2f)
-        val maxY = max(0f, (d.intrinsicHeight * s - height) / 2f)
-        tx = tx.coerceIn(-maxX, maxX); ty = ty.coerceIn(-maxY, maxY)
+        val scale = fitScale * userScale
+        val maxX = max(0f, (sourceWidth * scale - width) / 2f)
+        val maxY = max(0f, (sourceHeight * scale - height) / 2f)
+        tx = tx.coerceIn(-maxX, maxX)
+        ty = ty.coerceIn(-maxY, maxY)
+    }
+
+    override fun onDetachedFromWindow() {
+        clearDetailBitmap()
+        super.onDetachedFromWindow()
     }
 }

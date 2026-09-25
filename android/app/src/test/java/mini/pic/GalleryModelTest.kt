@@ -15,6 +15,65 @@ class GalleryModelTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun crownSensitivityScalesEveryInputToFortyPercent() {
+        assertEquals(4f, scaleCrownDelta(10f), 0f)
+        assertEquals(-2f, scaleCrownDelta(-5f), 0f)
+    }
+
+    @Test
+    fun regionSampleSizeKeepsViewportDetailWithinPixelBudget() {
+        val sample = gallerySampleSize(8000, 6000)
+        val decodedPixels = ((8000L + sample - 1) / sample) * ((6000L + sample - 1) / sample)
+
+        assertTrue(sample > 1)
+        assertTrue(sample and (sample - 1) == 0)
+        assertTrue(decodedPixels <= 4_000_000L)
+        assertTrue(8000 / sample >= 472)
+        assertTrue(6000 / sample >= 620)
+    }
+
+    @Test
+    fun exifOrientationMapsAllRawCornersIntoExpectedDisplayBounds() {
+        val rawWidth = 400f
+        val rawHeight = 300f
+        for (orientation in 1..8) {
+            val displaySize = orientedSize(rawWidth.toInt(), rawHeight.toInt(), orientation)
+            val points = listOf(
+                0f to 0f, rawWidth to 0f, rawWidth to rawHeight, 0f to rawHeight
+            ).map { (x, y) -> mapRawPointToOriented(x, y, rawWidth, rawHeight, orientation) }
+            assertEquals(0f, points.minOf { it.first }, 0f)
+            assertEquals(0f, points.minOf { it.second }, 0f)
+            assertEquals(displaySize.first.toFloat(), points.maxOf { it.first }, 0f)
+            assertEquals(displaySize.second.toFloat(), points.maxOf { it.second }, 0f)
+        }
+    }
+
+    @Test
+    fun orientedViewportRectMapsBackToRawImageBounds() {
+        val rect = ImageRect(20, 30, 120, 230)
+        val displayCorners = setOf(
+            rect.left to rect.top,
+            rect.right to rect.top,
+            rect.right to rect.bottom,
+            rect.left to rect.bottom
+        )
+        for (orientation in 1..8) {
+            val raw = orientedRectToRaw(rect, 300, 400, orientation)
+            assertTrue(raw.left >= 0 && raw.top >= 0)
+            assertTrue(raw.right <= 300 && raw.bottom <= 400)
+            assertTrue(raw.width > 0 && raw.height > 0)
+            val rawCorners = listOf(
+                raw.left to raw.top,
+                raw.right to raw.top,
+                raw.right to raw.bottom,
+                raw.left to raw.bottom
+            ).map { (x, y) -> mapRawPointToOriented(x.toFloat(), y.toFloat(), 300f, 400f, orientation) }
+                .map { it.first.toInt() to it.second.toInt() }.toSet()
+            assertEquals(displayCorners, rawCorners)
+        }
+    }
+
+    @Test
     fun scannerGroupsImagesAndKeepsSignatureOnlyAlbums() {
         val root = temporaryFolder.newFolder("storage")
         val album = File(root, "Pictures/Trips").apply { mkdirs() }

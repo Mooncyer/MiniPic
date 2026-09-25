@@ -46,6 +46,64 @@ internal class GalleryScanner(
     }
 }
 
+internal fun scaleCrownDelta(delta: Float, sensitivity: Float = 0.4f): Float = delta * sensitivity
+
+internal fun gallerySampleSize(sourceWidth: Int, sourceHeight: Int, pixelBudget: Int = 4_000_000): Int {
+    if (sourceWidth <= 0 || sourceHeight <= 0) return 1
+    var sample = 1
+    while (true) {
+        val width = (sourceWidth.toLong() + sample - 1L) / sample
+        val height = (sourceHeight.toLong() + sample - 1L) / sample
+        if (width * height <= pixelBudget) return sample
+        val next = sample shl 1
+        if (next <= 0) return sample
+        sample = next
+    }
+}
+
+internal fun mapRawPointToOriented(
+    x: Float,
+    y: Float,
+    rawWidth: Float,
+    rawHeight: Float,
+    orientation: Int
+): Pair<Float, Float> = when (orientation) {
+    2 -> rawWidth - x to y
+    3 -> rawWidth - x to rawHeight - y
+    4 -> x to rawHeight - y
+    5 -> y to x
+    6 -> rawHeight - y to x
+    7 -> rawHeight - y to rawWidth - x
+    8 -> y to rawWidth - x
+    else -> x to y
+}
+
+internal data class ImageRect(val left: Int, val top: Int, val right: Int, val bottom: Int) {
+    val width get() = right - left
+    val height get() = bottom - top
+}
+
+internal fun orientedSize(width: Int, height: Int, orientation: Int): Pair<Int, Int> =
+    if (orientation in 5..8) height to width else width to height
+
+internal fun orientedRectToRaw(
+    rect: ImageRect,
+    rawWidth: Int,
+    rawHeight: Int,
+    orientation: Int
+): ImageRect = when (orientation) {
+    2 -> ImageRect(rawWidth - rect.right, rect.top, rawWidth - rect.left, rect.bottom)
+    3 -> ImageRect(rawWidth - rect.right, rawHeight - rect.bottom,
+        rawWidth - rect.left, rawHeight - rect.top)
+    4 -> ImageRect(rect.left, rawHeight - rect.bottom, rect.right, rawHeight - rect.top)
+    5 -> ImageRect(rect.top, rect.left, rect.bottom, rect.right)
+    6 -> ImageRect(rect.top, rawHeight - rect.right, rect.bottom, rawHeight - rect.left)
+    7 -> ImageRect(rawWidth - rect.bottom, rawHeight - rect.right,
+        rawWidth - rect.top, rawHeight - rect.left)
+    8 -> ImageRect(rawWidth - rect.bottom, rect.left, rawWidth - rect.top, rect.right)
+    else -> rect
+}
+
 internal fun sameGallerySnapshot(
     first: Map<String, List<Pic>>,
     second: Map<String, List<Pic>>
