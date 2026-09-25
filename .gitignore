@@ -1,0 +1,16 @@
+# Android/Gradle
+.gradle/
+**/build/
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# Outputs
+*.apk
+*.aab
+*.zip
+
+# Local runtime/cache
+*.log
