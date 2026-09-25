@@ -1,7 +1,7 @@
 # MiniPic 技术说明
 
 > 更新：2026-09-25
-> 当前版本：0.0.4（versionCode 4）
+> 当前版本：0.0.5（versionCode 5）
 > 项目根目录：当前工作区；Android 工程位于 `android/`
 
 ## 技术基线
@@ -22,8 +22,9 @@
 android/app/src/main/
 ├── AndroidManifest.xml
 ├── java/mini/pic/
-│   ├── MainActivity.kt       # 页面、权限、导航、文件 I/O 协调、PhotoView/手势
-│   └── GalleryModel.kt       # Pic、GalleryScanner、快照比较、目录与重名规则
+│   ├── MainActivity.kt       # 页面、权限、导航、文件 I/O 协调、查看器分发
+│   ├── GalleryModel.kt       # Pic、GalleryScanner、排序和文件名/路径规则
+│   └── MangaView.kt          # 漫画连续纵向画布和可见页 Bitmap 生命周期
 └── res/
     ├── raw/minipic_gallery_signature.png
     ├── mipmap-*/ic_launcher.png
@@ -47,7 +48,11 @@ android/app/src/test/java/mini/pic/GalleryModelTest.kt
 - 静态图预览限制在约一倍屏幕尺寸；放大超过阈值后，PhotoView 根据固定原图坐标计算可视区域，带 25% overscan 用 `BitmapRegionDecoder` 解码并把 tile 叠加回原图坐标。
 - Region 采样使用 2 次幂倍率，按当前区域像素预算选择尽可能小的 sample；单 tile 上限约 4MP。缩放/拖动通过 90ms 去抖和单线程查看器队列只保留最新请求，预览/上一 tile 在新 tile 到达前继续绘制。
 - EXIF 方向使用统一 raw/oriented 坐标映射；API 23-27 的预览额外应用方向变换。GIF/动画 WebP 检测为 Animatable 后保留动画预览，不叠静态区域，避免 tile 与动图帧错位。
-- 表冠 VSCROLL/SCROLL/HSCROLL 读到原始 delta 后统一乘 `CROWN_SENSITIVITY=0.4`，页面滚动、图像缩放和翻图累计共用该值；列表滚动累积小数像素余量。
+- 表冠 VSCROLL/SCROLL/HSCROLL 读到原始 delta 后统一乘 `CROWN_SENSITIVITY=0.4`；普通页面和单图查看复用该值，列表滚动累积小数像素余量。
+- 漫画模式为独立 `MangaView` 连续画布：相册内图片按自然数字文件名排序，`1, 2, 10` 不会发生字典序错位；每张图独立按屏幕等宽绘制，相邻图片零间距首尾拼接。
+- 漫画页高先异步读取并建立前缀表；绘制/解码只处理当前视口附近页面，页面 Bitmap 按目标宽度采样并回收远离视口超过 3 页的缓存。单页解码使用约 2MP 像素预算，避免长章节多页高分辨率 Bitmap 同时驻留。
+- 漫画模式初始 zoom=1（屏幕等宽），手指拖动支持任意停留和减速惯性；表冠“滚动缩放”开时缩放画布，关时纵向滚动画布。
+- 外部 `ACTION_VIEW` 不进入漫画模式；漫画操作页针对当前可见页工作，隐藏对整个章节语义不明确的旋转操作。
 - 复制通过流式 I/O 写入 MediaStore `IS_PENDING` 项，使用完整 `RELATIVE_PATH`，处理重名后才提交。失败时清理目标项并保留源图。
 - 移动按“复制并提交目标 → 删除源文件”执行。无法删除源 URI 时不谎报移动成功，提示复制已完成但移动未完成。
 - 删除失败不会截断或覆盖源文件。MediaStore/URI 授权失败会返回失败状态；可恢复的系统删除授权流程仍需设备端实测后补齐。
@@ -70,13 +75,15 @@ $env:ANDROID_SDK_ROOT='E:\Data\Android'
 
 最近一次全量验证：JVM 单测通过，Debug、Lint、Release 构建成功。Lint 当前 0 errors、6 warnings；警告主要是权限商店政策、target SDK 提示、固定竖屏、备份属性和重复图标密度资源。Release 未配置正式签名；构建成功不代表可直接发布。
 
-自动化测试覆盖扫描分组/隐藏目录/签名目录、相同数量下的内容替换、嵌套相对目录、重名规则、表冠 0.4 换算、区域解码像素预算和 EXIF 八方向映射。9 项 JVM 测试均通过。
-0.0.4 在 OWW211/API 30 上可正常安装并打开约 7.8 MB JPEG；冷启动查看器约 38.9 MB PSS / 64.7 MB RSS，最终返回主页后约 46.6 MB PSS / 73.3 MB RSS，无 crash。该 JPEG 的内容本身是缩放后仍显得像素化的素材；ADB `input roll` 未触发标准 ACTION_SCROLL，且系统拒绝对触摸 event 节点执行 `sendevent`，因此本轮不能声称已实测 pinch 后区域细节。需用户在手表上实际放大并确认 tile 清晰度、EXIF 旋转和高倍率内存。
+自动化测试覆盖扫描分组/隐藏目录/签名目录、同数量内容替换、嵌套目录、重名规则、自然数字文件名排序、表冠 0.4 换算、漫画 Bitmap 采样预算、区域像素预算与 EXIF 映射。12 项 JVM 测试全部通过。
+0.0.5 在 OWW211/API 30 上安装成功。使用测试 ZIP 的 21 张 WebP 验证漫画模式：相册开关开启后，首图等宽显示；连续拖动越过多页时无分页空隙/回顶，viewer 持续在前台。章节加载后测得约 65–72 MB PSS / 79–92 MB RSS，无 MiniPic crash。设置已在测试结束后恢复为 `mangaMode=false`、`crownZoom=true`。真实表冠由 REL_WHEEL 驱动，ADB roll 不等价，因此需手动确认开关两种行为和灵敏度。
+
+测试 ZIP 包含 21 张有前导零编号 WebP，设备自然顺序与文件名相符。单测额外覆盖未补零 `1,2,10` 的自然比较。动画 GIF/WebP 为保留性能使用动画预览而非漫画静态 tile。
 
 ## 尚需验收与后续工程工作
 
-1. 手动验证 OWW211 实体表冠约 40% 灵敏度、方向和快慢滚动。
-2. 实际放大高清静态图，确认区域 tile 清晰度、平移覆盖与 EXIF 方向；记录峰值 PSS/RSS 和滚动帧时。
-3. 核对 GIF/动画 WebP 继续动画但保持预览分辨率的预期行为。
+1. 手动验证 OWW211 实体表冠约 40% 灵敏度，以及漫画模式下“表冠缩放开/关”两种映射。
+2. 长章节快速拖动、惯性滑行、缩放后平移和边缘回收，记录 GC、稳态帧时和峰值内存。
+3. 核对带 EXIF 旋转图片、GIF/动画 WebP 的方向和预览策略。
 4. 完成权限拒绝/URI 写授权和删除流程的端到端测试。
-5. 按图库压力数据评估增量索引、回收选择器和 Activity 模块拆分。
+5. 按图库压力数据评估增量索引、回收选择器列表和 Activity 模块拆分。

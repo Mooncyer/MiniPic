@@ -72,6 +72,7 @@ class MainActivity : Activity() {
     private var pickerScroll: ScrollView? = null
     private var selectScroll: ScrollView? = null
     private var viewer: PhotoView? = null
+    private var mangaViewer: MangaView? = null
     private var viewerPics = listOf<Pic>()
     private var viewerIndex = 0
     private var rotation = 0f
@@ -82,6 +83,7 @@ class MainActivity : Activity() {
 
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private val isExternal get() = intent?.action == Intent.ACTION_VIEW && intent?.data != null
+    private val mangaMode get() = prefs.getBoolean("mangaMode", false)
     private val dark get() = prefs.getBoolean("dark", true)
     private val bg get() = if (dark) Color.BLACK else Color.rgb(247, 249, 249)
     private val surface get() = if (dark) Color.rgb(28, 31, 32) else Color.WHITE
@@ -385,8 +387,7 @@ class MainActivity : Activity() {
     private var touchY = 0f
 
     private fun observeGestures(e: MotionEvent) {
-        if (page != Page.VIEWER) return
-        if (viewer?.isAtFitScale() != true) return
+        if (page != Page.VIEWER || mangaMode || viewer?.isAtFitScale() != true) return
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> { touchX = e.x; touchY = e.y }
             MotionEvent.ACTION_UP -> {
@@ -433,6 +434,7 @@ class MainActivity : Activity() {
 
     private fun showAlbums() {
         page = Page.ALBUMS
+        mangaViewer = null
         updateSystemUi(false)
         replaceContent(buildAlbumsPage())
     }
@@ -666,6 +668,7 @@ class MainActivity : Activity() {
         column.addView(settingCard("主页相册", "选择展示在主页的相册") { showAlbumSelection() })
         column.addView(settingCard("新建相册", "在 Pictures 中创建") { newAlbum() })
         column.addView(switchCard("表冠滚动缩放", prefs.getBoolean("crownZoom", true)) { prefs.edit().putBoolean("crownZoom", it).apply() })
+        column.addView(switchCard("开启漫画模式", mangaMode) { prefs.edit().putBoolean("mangaMode", it).apply() })
         column.addView(switchCard("扫描隐藏文件", prefs.getBoolean("hidden", false)) { prefs.edit().putBoolean("hidden", it).apply(); scan() })
         column.addView(themeCard())
         column.addView(settingCard("重新扫描", "更新本地图片列表") { scan(); toast("正在扫描…") })
@@ -679,7 +682,9 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
             setPadding(dp(14), dp(4), dp(14), dp(4))
         }
-        val actions = mutableListOf("复制", "移动", "删除", "旋转")
+        val actions = if (mangaViewer != null)
+            mutableListOf("复制", "移动", "删除")
+        else mutableListOf("复制", "移动", "删除", "旋转")
         if (!isExternal) actions += "设为封面"
         actions.forEach { name ->
             column.addView(actionPill(name) { runAction(name) },
@@ -695,6 +700,8 @@ class MainActivity : Activity() {
     private var detailRequestRunnable: Runnable? = null
 
     private fun buildViewerPage(): View {
+        if (mangaMode && !isExternal) return buildMangaViewerPage()
+        mangaViewer = null
         page = Page.VIEWER
         updateSystemUi(true)
         val host = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
@@ -800,8 +807,63 @@ class MainActivity : Activity() {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════
-    //  VIEWER / EXTERNAL
+    private fun decodeMangaBitmap(pic: Pic, targetWidth: Int): Bitmap? {
+        val uri = Uri.fromFile(File(pic.path))
+        val metadata = readImageMetadata(uri)
+        val orientedSource = orientedSize(metadata.width, metadata.height, metadata.orientation)
+        val targetHeight = max(1, (targetWidth.toFloat() * orientedSource.second / orientedSource.first).roundToInt())
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        openImageStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        val sample = bitmapSampleSize(bounds.outWidth, bounds.outHeight, targetWidth, targetHeight, 2_000_000)
+        val raw = decodeSampled(uri, max(1, bounds.outWidth / sample), max(1, bounds.outHeight / sample)) ?: return null
+        if (metadata.orientation == ExifInterface.ORIENTATION_NORMAL) return raw
+        val orientedBitmap = orientedSize(raw.width, raw.height, metadata.orientation)
+        val source = floatArrayOf(
+            0f, 0f, raw.width.toFloat(), 0f,
+            raw.width.toFloat(), raw.height.toFloat(), 0f, raw.height.toFloat()
+        )
+        val target = FloatArray(8)
+        for (index in 0 until 4) {
+            val point = mapRawPointToOriented(
+                source[index * 2], source[index * 2 + 1], raw.width.toFloat(), raw.height.toFloat(), metadata.orientation
+            )
+            target[index * 2] = point.first
+            target[index * 2 + 1] = point.second
+        }
+        val matrix = Matrix()
+        if (!matrix.setPolyToPoly(source, 0, target, 0, 4)) return raw
+        val result = Bitmap.createBitmap(orientedBitmap.first, orientedBitmap.second, Bitmap.Config.ARGB_8888)
+        Canvas(result).drawBitmap(raw, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
+        raw.recycle()
+        return result
+    }
+
+    private fun buildMangaViewerPage(): View {
+        page = Page.VIEWER
+        updateSystemUi(true)
+        val host = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val pages = naturalImageOrder(viewerPics)
+        viewerPics = pages
+        viewerIndex = 0
+        viewer = null
+        val manga = MangaView(
+            this,
+            pages,
+            viewerIo,
+            readMetrics = { pic ->
+                val metadata = readImageMetadata(Uri.fromFile(File(pic.path)))
+                val oriented = orientedSize(metadata.width, metadata.height, metadata.orientation)
+                MangaPageMetrics(oriented.first, oriented.second)
+            },
+            loadBitmap = { pic, targetWidth -> decodeMangaBitmap(pic, targetWidth) }
+        )
+        mangaViewer = manga
+        manga.onPageChanged = { index ->
+            if (index in viewerPics.indices) viewerIndex = index
+        }
+        host.addView(manga, FrameLayout.LayoutParams(-1, -1))
+        return host
+    }
     // ══════════════════════════════════════════════════════════════════
 
     private fun showExternal(uri: Uri) {
@@ -1294,7 +1356,14 @@ class MainActivity : Activity() {
             if (delta != 0f) {
                 delta = scaleCrownDelta(delta, CROWN_SENSITIVITY)
                 if (page == Page.VIEWER) {
-                    if (prefs.getBoolean("crownZoom", true)) {
+                    val manga = mangaViewer
+                    if (manga != null) {
+                        if (prefs.getBoolean("crownZoom", true)) {
+                            manga.zoomBy(-delta)
+                        } else {
+                            manga.scrollByDistance(-delta * dp(3f))
+                        }
+                    } else if (prefs.getBoolean("crownZoom", true)) {
                         viewer?.zoomBy(-delta)
                     } else {
                         // Time-gated image switching

@@ -15,9 +15,34 @@ class GalleryModelTest {
     val temporaryFolder = TemporaryFolder()
 
     @Test
+    fun naturalImageOrderSortsNumericNamesByValue() {
+        val folder = "folder"
+        val input = listOf("11.webp", "1.webp", "10.webp", "2.webp", "09.webp")
+            .mapIndexed { index, name -> Pic("$name", folder, index.toLong()) }
+
+        val names = naturalImageOrder(input).map { File(it.path).name }
+
+        assertEquals(listOf("1.webp", "2.webp", "09.webp", "10.webp", "11.webp"), names)
+    }
+
+    @Test
+    fun naturalFileNameCompareHandlesMixedTextAndNumbers() {
+        assertTrue(naturalFileNameCompare("page2.webp", "page10.webp") < 0)
+        assertTrue(naturalFileNameCompare("page10.webp", "page2.webp") > 0)
+        assertTrue(naturalFileNameCompare("A02.webp", "a2.webp") > 0)
+    }
+    @Test
     fun crownSensitivityScalesEveryInputToFortyPercent() {
         assertEquals(4f, scaleCrownDelta(10f), 0f)
         assertEquals(-2f, scaleCrownDelta(-5f), 0f)
+    }
+
+    @Test
+    fun bitmapSampleSizeRespectsTargetAndPixelBudget() {
+        val sample = bitmapSampleSize(4000, 6000, 378, 567, 2_000_000)
+        val pixels = ((4000L + sample - 1) / sample) * ((6000L + sample - 1) / sample)
+        assertTrue(sample and (sample - 1) == 0)
+        assertTrue(pixels <= 2_000_000L)
     }
 
     @Test

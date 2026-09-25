@@ -48,6 +48,30 @@ internal class GalleryScanner(
 
 internal fun scaleCrownDelta(delta: Float, sensitivity: Float = 0.4f): Float = delta * sensitivity
 
+internal fun bitmapSampleSize(
+    sourceWidth: Int,
+    sourceHeight: Int,
+    targetWidth: Int,
+    targetHeight: Int,
+    pixelBudget: Int? = null
+): Int {
+    if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return 1
+    val targetScale = minOf(targetWidth.toFloat() / sourceWidth, targetHeight.toFloat() / sourceHeight)
+    var sample = 1
+    while (1f / (sample * 2) >= targetScale) sample *= 2
+    if (pixelBudget != null && pixelBudget > 0) {
+        while (true) {
+            val width = (sourceWidth.toLong() + sample - 1L) / sample
+            val height = (sourceHeight.toLong() + sample - 1L) / sample
+            if (width * height <= pixelBudget) break
+            val next = sample shl 1
+            if (next <= 0) break
+            sample = next
+        }
+    }
+    return sample
+}
+
 internal fun gallerySampleSize(sourceWidth: Int, sourceHeight: Int, pixelBudget: Int = 4_000_000): Int {
     if (sourceWidth <= 0 || sourceHeight <= 0) return 1
     var sample = 1
@@ -117,6 +141,41 @@ internal fun relativeFolderPath(storageRoot: File, folder: File): String? {
     val prefix = rootPath + File.separator
     if (!folderPath.startsWith(prefix)) return null
     return folderPath.removePrefix(prefix).replace(File.separatorChar, '/') + "/"
+}
+
+internal fun naturalFileNameCompare(left: String, right: String): Int {
+    var a = 0
+    var b = 0
+    while (a < left.length && b < right.length) {
+        val ca = left[a]
+        val cb = right[b]
+        if (ca.isDigit() && cb.isDigit()) {
+            val aStart = a
+            val bStart = b
+            while (a < left.length && left[a].isDigit()) a++
+            while (b < right.length && right[b].isDigit()) b++
+            val aDigits = left.substring(aStart, a).trimStart('0').ifEmpty { "0" }
+            val bDigits = right.substring(bStart, b).trimStart('0').ifEmpty { "0" }
+            if (aDigits.length != bDigits.length) return aDigits.length - bDigits.length
+            val numeric = aDigits.compareTo(bDigits)
+            if (numeric != 0) return numeric
+            val aRawLength = a - aStart
+            val bRawLength = b - bStart
+            if (aRawLength != bRawLength) return aRawLength - bRawLength
+        } else {
+            val aLower = ca.lowercaseChar()
+            val bLower = cb.lowercaseChar()
+            if (aLower != bLower) return aLower.code - bLower.code
+            a++
+            b++
+        }
+    }
+    return (left.length - a) - (right.length - b)
+}
+
+internal fun naturalImageOrder(photos: List<Pic>): List<Pic> = photos.sortedWith { left, right ->
+    val nameCompare = naturalFileNameCompare(File(left.path).name, File(right.path).name)
+    if (nameCompare != 0) nameCompare else left.path.compareTo(right.path)
 }
 
 internal fun uniqueFileName(requested: String, exists: (String) -> Boolean): String {
