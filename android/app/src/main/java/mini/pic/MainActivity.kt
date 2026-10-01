@@ -34,9 +34,9 @@ import java.util.concurrent.Executors
 import kotlin.math.*
 
 private const val SIGNATURE = GALLERY_SIGNATURE
-private const val CROWN_SENSITIVITY = 0.4f
 private const val REGION_OVERSCAN = 1.25f
 private const val REGION_PIXEL_BUDGET = 4_000_000
+internal const val IMAGE_SWITCH_ANIM_DURATION_MS = 150L
 
 data class DetailRequest(
     val token: Long,
@@ -60,11 +60,25 @@ class MainActivity : Activity() {
     private val fileIo = Executors.newSingleThreadExecutor()
     private val coverIo = Executors.newFixedThreadPool(2)
     private val viewerIo = Executors.newSingleThreadExecutor()
+    private val imageIo = java.util.concurrent.ThreadPoolExecutor(
+        1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+        java.util.concurrent.LinkedBlockingQueue<Runnable>()
+    )
     private val coverCache = object : LinkedHashMap<String, Bitmap>(32, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>): Boolean = size > 24
     }
     private val albums = linkedMapOf<String, MutableList<Pic>>()
     private var page = Page.ALBUMS
+        set(value) {
+            if (field != value) {
+                cancelViewerLoads()
+                if (field == Page.VIEWER) cancelViewerTransition()
+                crownPages.reset()
+                pageSwipeEligible = false
+                viewer?.onViewportChanged = null
+            }
+            field = value
+        }
     private var previousPage = Page.ALBUMS
     private var albumGrid: RecyclerView? = null
     private var albumAdapter: AlbumAdapter? = null
@@ -84,6 +98,9 @@ class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
     private val isExternal get() = intent?.action == Intent.ACTION_VIEW && intent?.data != null
     private val mangaMode get() = prefs.getBoolean("mangaMode", false)
+    private val crownSensitivity get() = validCrownSensitivity(
+        prefs.getFloat("crownSensitivity", DEFAULT_CROWN_SENSITIVITY)
+    )
     private val dark get() = prefs.getBoolean("dark", true)
     private val bg get() = if (dark) Color.BLACK else Color.rgb(247, 249, 249)
     private val surface get() = if (dark) Color.rgb(28, 31, 32) else Color.WHITE
@@ -177,8 +194,12 @@ class MainActivity : Activity() {
         toast("未授予图库访问权限")
     }
 
+    private var activityResumed = false
+
     override fun onResume() {
         super.onResume()
+        activityResumed = true
+        viewer?.setPlaybackActive(true)
         if (permissionSettingsRequested) {
             permissionSettingsRequested = false
             if (Build.VERSION.SDK_INT >= 30 && Environment.isExternalStorageManager()) {
@@ -188,6 +209,12 @@ class MainActivity : Activity() {
                 showPermissionHint()
             }
         }
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        viewer?.setPlaybackActive(false)
+        super.onPause()
     }
 
     override fun onRequestPermissionsResult(code: Int, p: Array<out String>, g: IntArray) {
@@ -427,7 +454,6 @@ class MainActivity : Activity() {
                 Page.VIEWER -> animateSlideToActions()
                 else -> { animating = false; return false }
             }
-            animating = false
             return true
         }
         return false
@@ -439,21 +465,27 @@ class MainActivity : Activity() {
 
     private var touchX = 0f
     private var touchY = 0f
+    private var pageSwipeEligible = false
 
     private fun observeGestures(e: MotionEvent) {
-        if (page != Page.VIEWER || mangaMode || viewer?.isAtFitScale() != true) return
         when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> { touchX = e.x; touchY = e.y }
+            MotionEvent.ACTION_DOWN -> {
+                touchX = e.x
+                touchY = e.y
+                pageSwipeEligible = page == Page.VIEWER && mangaViewer == null &&
+                    !isExternal && viewer?.isAtFitScale() == true
+            }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> pageSwipeEligible = false
+            MotionEvent.ACTION_MOVE -> if (viewer?.isAtFitScale() != true) pageSwipeEligible = false
             MotionEvent.ACTION_UP -> {
+                val eligible = pageSwipeEligible
+                pageSwipeEligible = false
+                if (!eligible || page != Page.VIEWER || viewer?.isAtFitScale() != true) return
                 val dy = e.y - touchY
                 val dx = e.x - touchX
-                if (abs(dy) > dp(42) && abs(dy) > abs(dx) && !isExternal) {
-                    val next = if (dy < 0) viewerIndex + 1 else viewerIndex - 1
-                    if (next in viewerPics.indices) {
-                        viewerIndex = next; rotation = 0f
-                        val dir = if (dy < 0) -1f else 1f  // -1 = next (up), 1 = prev (down)
-                        slideToImage(dir)
-                    }
+                if (abs(dy) > dp(42) && abs(dy) > abs(dx)) {
+                    crownPages.reset()
+                    requestImageStep(if (dy < 0) 1 else -1)
                 }
             }
         }
@@ -464,6 +496,8 @@ class MainActivity : Activity() {
     // ══════════════════════════════════════════════════════════════════
 
     override fun onBackPressed() {
+        for (index in 0 until stableRoot.childCount) stableRoot.getChildAt(index).animate().cancel()
+        animating = false
         when (page) {
             Page.VIEWER -> leaveViewer()
             Page.ACTIONS -> replaceContent(buildViewerPage())
@@ -494,6 +528,8 @@ class MainActivity : Activity() {
     }
 
     private fun replaceContent(view: View) {
+        for (index in 0 until stableRoot.childCount) stableRoot.getChildAt(index).animate().cancel()
+        animating = false
         stableRoot.removeAllViews()
         stableRoot.addView(view, FrameLayout.LayoutParams(-1, -1))
     }
@@ -558,68 +594,137 @@ class MainActivity : Activity() {
             }
     }
 
-    /**
-     * Vertical slide transition for viewer image switching.
-     * @param direction  -1 = next (slides up), 1 = previous (slides down)
-     */
-    private fun slideToImage(direction: Float) {
-        if (animating) return
-        animating = true
-        val oldView = stableRoot.getChildAt(0)
-        val h = resources.displayMetrics.heightPixels.toFloat()
+    private fun requestImageStep(step: Int) {
+        if (page != Page.VIEWER || mangaViewer != null || isExternal || step == 0) return
+        val base = pendingViewerIndex ?: viewerIndex
+        val target = requestedPageIndex(base, step, viewerPics.size)
+        if (target == base) return
+        cancelViewerTransition()
+        val photo = viewer ?: return
+        if (target == viewerIndex && photo.hasImage()) {
+            cancelViewerLoads()
+            photo.requestDetailUpdate()
+            return
+        }
+        loadViewerImage(photo, target, 0f)
+    }
 
-        // Build new viewer
-        page = Page.VIEWER
-        updateSystemUi(true)
-        val newPhoto = PhotoView(this).apply { setBackgroundColor(Color.BLACK) }
-        viewer = newPhoto
-        val newHost = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        newHost.addView(newPhoto, FrameLayout.LayoutParams(-1, -1))
+    private fun cancelViewerTransition() {
+        viewerTransitionGeneration++
+        val host = viewerHost ?: return
+        for (index in 0 until host.childCount) {
+            val child = host.getChildAt(index)
+            child.animate().cancel()
+            child.translationY = 0f
+            child.translationX = 0f
+            child.alpha = 1f
+            child.setLayerType(View.LAYER_TYPE_NONE, null)
+        }
+        val current = viewer
+        if (current != null && current.parent === host) {
+            for (index in host.childCount - 1 downTo 0) {
+                val child = host.getChildAt(index)
+                if (child !== current) host.removeViewAt(index)
+            }
+        }
+        viewerTransitionDirection = 0
+    }
 
-        val generation = ++imageLoadGeneration
+    private fun animateViewerTransition(oldPhoto: PhotoView, newPhoto: PhotoView, direction: Int) {
+        val host = viewerHost ?: return
+        val generation = ++viewerTransitionGeneration
+        val distance = max(host.height, resources.displayMetrics.heightPixels).toFloat()
+        viewerTransitionDirection = direction
+        newPhoto.translationY = direction * distance
+        newPhoto.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        oldPhoto.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        newPhoto.animate()
+            .translationY(0f)
+            .setDuration(IMAGE_SWITCH_ANIM_DURATION_MS)
+            .setInterpolator(DecelerateInterpolator())
+            .withEndAction {
+                if (generation != viewerTransitionGeneration || viewer !== newPhoto || viewerHost !== host) return@withEndAction
+                oldPhoto.animate().cancel()
+                host.removeView(oldPhoto)
+                newPhoto.translationY = 0f
+                newPhoto.setLayerType(View.LAYER_TYPE_NONE, null)
+                viewerTransitionDirection = 0
+            }
+            .start()
+        oldPhoto.animate()
+            .translationY(-direction * distance)
+            .setDuration(IMAGE_SWITCH_ANIM_DURATION_MS)
+            .setInterpolator(DecelerateInterpolator())
+            .start()
+    }
+
+    private fun cancelViewerLoads() {
+        imageLoadGeneration++
+        imageLoadFuture?.cancel(true)
+        imageLoadFuture = null
+        imageIo.purge()
+        pendingViewerIndex = null
         detailRequestGeneration++
         detailRequestFuture?.cancel(true)
         detailRequestFuture = null
         detailRequestHandler.removeCallbacksAndMessages(null)
-        val uri = currentUri()
-        val rotationForLoad = rotation
-        viewerIo.execute {
+    }
+
+    private fun loadViewerImage(photo: PhotoView, target: Int, rotationForLoad: Float) {
+        cancelViewerLoads()
+        pendingViewerIndex = target
+        val generation = imageLoadGeneration
+        val path = viewerPics.getOrNull(target)?.path ?: return
+        val uri = if (path.startsWith("content:") || path.startsWith("file:")) Uri.parse(path)
+            else Uri.fromFile(File(path))
+        val width = max(1, resources.displayMetrics.widthPixels)
+        val height = max(1, resources.displayMetrics.heightPixels)
+        imageLoadFuture = imageIo.submit {
             val metadata = readImageMetadata(uri)
-            val drawable = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels),
-                max(1, resources.displayMetrics.heightPixels), metadata.orientation)
-            if (isFinishing || isDestroyed) return@execute
+            if (Thread.currentThread().isInterrupted) return@submit
+            val drawable = decodeDrawable(uri, width, height, metadata.orientation)
+            if (Thread.currentThread().isInterrupted || isFinishing || isDestroyed) {
+                releasePreview(drawable)
+                return@submit
+            }
             runOnUiThread {
-                if (generation != imageLoadGeneration || page != Page.VIEWER || isFinishing || isDestroyed) {
-                    animating = false
+                if (generation != imageLoadGeneration || photo !== viewer || page != Page.VIEWER ||
+                    isFinishing || isDestroyed) {
+                    releasePreview(drawable)
                     return@runOnUiThread
                 }
-                if (drawable == null) { animating = false; return@runOnUiThread }
-                bindViewerImage(newPhoto, uri, metadata, drawable, rotationForLoad)
-
-                // New starts from the opposite side and slides into view
-                newHost.translationY = -direction * h
-                stableRoot.addView(newHost, FrameLayout.LayoutParams(-1, -1))
-
-                // Animate old out, new in
-                newHost.setLayerType(View.LAYER_TYPE_HARDWARE, null)
-
-                newHost.animate()
-                    .translationY(0f)
-                    .setDuration(animDuration)
-                    .setInterpolator(DecelerateInterpolator())
-
-                oldView?.animate()
-                    ?.translationY(direction * h)
-                    ?.setDuration(animDuration)
-                    ?.setInterpolator(DecelerateInterpolator())
-                    ?.withEndAction {
-                        stableRoot.removeView(oldView)
-                        newHost.setLayerType(View.LAYER_TYPE_NONE, null)
-                        animating = false
-                    }
+                imageLoadFuture = null
+                pendingViewerIndex = null
+                if (drawable == null) {
+                    toast("图片加载失败")
+                    return@runOnUiThread
+                }
+                // Commit the target only after decode succeeds; actions stay aligned with the incoming image.
+                val oldPhoto = photo.takeIf { it.hasImage() && it.parent === viewerHost }
+                val direction = if (target > viewerIndex) 1 else -1
+                val incoming = if (oldPhoto != null) PhotoView(this).apply {
+                    setBackgroundColor(Color.BLACK)
+                } else photo
+                if (oldPhoto != null) {
+                    viewerHost?.addView(incoming, FrameLayout.LayoutParams(-1, -1))
+                }
+                bindViewerImage(incoming, uri, metadata, drawable, rotationForLoad)
+                incoming.contentDescription = File(path).name
+                viewer = incoming
+                viewerIndex = target
+                rotation = rotationForLoad
+                if (oldPhoto != null) animateViewerTransition(oldPhoto, incoming, direction)
+                else incoming.translationY = 0f
             }
         }
     }
+
+    private fun releasePreview(drawable: Drawable?) {
+        (drawable as? Animatable)?.stop()
+        drawable?.callback = null
+        (drawable as? BitmapDrawable)?.bitmap?.let { if (!it.isRecycled) it.recycle() }
+    }
+
 
     // ══════════════════════════════════════════════════════════════════
     //  BUILD PAGE VIEWS
@@ -627,13 +732,17 @@ class MainActivity : Activity() {
 
     private fun buildAlbumsPage(): View {
         page = Page.ALBUMS
+        updateSystemUi(false)
         previousPage = Page.ALBUMS
         val column = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(7), dp(2), dp(7), dp(10))
         }
-        column.addView(label("相册", 20f, true).apply { gravity = Gravity.CENTER },
-            LinearLayout.LayoutParams(-1, dp(33)))
+        column.addView(label("相册", 20f, true).apply {
+            gravity = Gravity.CENTER
+            contentDescription = "相册，退出应用"
+            setOnClickListener { finishAndRemoveTask() }
+        }, LinearLayout.LayoutParams(-1, dp(33)))
 
         albumGrid = RecyclerView(this).apply {
             val manager = GridLayoutManager(this@MainActivity, 2)
@@ -721,11 +830,16 @@ class MainActivity : Activity() {
         column.addView(label("设置", 20f, true).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(-1, dp(34)))
         column.addView(settingCard("主页相册", "选择展示在主页的相册") { showAlbumSelection() })
         column.addView(settingCard("新建相册", "在 Pictures 中创建") { newAlbum() })
-        column.addView(switchCard("表冠滚动缩放", prefs.getBoolean("crownZoom", true)) { prefs.edit().putBoolean("crownZoom", it).apply() })
+        column.addView(switchCard("表冠滚动缩放", prefs.getBoolean("crownZoom", true)) {
+            prefs.edit().putBoolean("crownZoom", it).apply()
+            crownPages.reset()
+        })
+        column.addView(crownSensitivityControl())
         column.addView(switchCard("开启漫画模式", mangaMode) { prefs.edit().putBoolean("mangaMode", it).apply() })
         column.addView(switchCard("扫描隐藏文件", prefs.getBoolean("hidden", false)) { prefs.edit().putBoolean("hidden", it).apply(); scan() })
         column.addView(themeCard())
         column.addView(settingCard("重新扫描", "更新本地图片列表") { scan(); toast("正在扫描…") })
+        column.addView(settingCard("许可证", "GNU AGPL-3.0，无担保") { showLicenseDialog() })
         settingsScroll!!.addView(column)
         return settingsScroll!!
     }
@@ -747,43 +861,38 @@ class MainActivity : Activity() {
         return column
     }
 
+    private var viewerHost: FrameLayout? = null
+    private var viewerTransitionGeneration = 0L
+    private var viewerTransitionDirection = 0
     private var imageLoadGeneration = 0L
+    private var imageLoadFuture: java.util.concurrent.Future<*>? = null
+    private var pendingViewerIndex: Int? = null
     private var detailRequestGeneration = 0L
     private var detailRequestFuture: java.util.concurrent.Future<*>? = null
     private val detailRequestHandler = Handler(Looper.getMainLooper())
     private var detailRequestRunnable: Runnable? = null
 
     private fun buildViewerPage(): View {
+        cancelViewerTransition()
+        viewerHost = null
+        pageSwipeEligible = false
+        crownPages.reset()
         if (mangaMode && !isExternal) return buildMangaViewerPage()
         mangaViewer = null
         page = Page.VIEWER
         updateSystemUi(true)
         val host = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        viewerHost = host
         val photo = PhotoView(this).apply { setBackgroundColor(Color.BLACK) }
         viewer = photo
         host.addView(photo, FrameLayout.LayoutParams(-1, -1))
-        val generation = ++imageLoadGeneration
-        detailRequestGeneration++
-        detailRequestFuture?.cancel(true)
-        detailRequestFuture = null
-        detailRequestHandler.removeCallbacksAndMessages(null)
-        val uri = currentUri()
-        val rotationForLoad = rotation
-        viewerIo.execute {
-            val metadata = readImageMetadata(uri)
-            val preview = decodeDrawable(uri, max(1, resources.displayMetrics.widthPixels),
-                max(1, resources.displayMetrics.heightPixels), metadata.orientation)
-            if (isFinishing || isDestroyed) return@execute
-            runOnUiThread {
-                if (generation != imageLoadGeneration || isFinishing || isDestroyed) return@runOnUiThread
-                bindViewerImage(photo, uri, metadata, preview, rotationForLoad)
-            }
-        }
+        loadViewerImage(photo, viewerIndex, rotation)
         return host
     }
 
     private fun bindViewerImage(photo: PhotoView, uri: Uri, metadata: ImageMetadata, drawable: Drawable?, rotationForLoad: Float) {
         val supportsRegionDetail = drawable !is Animatable
+        photo.setPlaybackActive(activityResumed)
         photo.setImageSource(metadata.width, metadata.height, metadata.orientation, supportsRegionDetail)
         photo.setDrawable(drawable)
         photo.rotation = rotationForLoad
@@ -791,7 +900,6 @@ class MainActivity : Activity() {
             { request -> requestDetailRegion(photo, uri, request) }
         } else null
         if (supportsRegionDetail) photo.requestDetailUpdate()
-        (drawable as? Animatable)?.start()
     }
 
     private fun readImageMetadata(uri: Uri): ImageMetadata {
@@ -799,17 +907,19 @@ class MainActivity : Activity() {
             openImageStream(uri)?.use { input ->
                 val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeStream(input, null, bounds)
-                val orientation = openImageStream(uri)?.use { stream ->
-                    ExifInterface(stream).getAttributeInt(
-                        ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
-                    )
-                } ?: ExifInterface.ORIENTATION_NORMAL
+                val orientation = try {
+                    openImageStream(uri)?.use { stream ->
+                        ExifInterface(stream).getAttributeInt(
+                            ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL
+                        )
+                    } ?: ExifInterface.ORIENTATION_NORMAL
+                } catch (_: Exception) { ExifInterface.ORIENTATION_NORMAL }
                 ImageMetadata(bounds.outWidth.coerceAtLeast(1), bounds.outHeight.coerceAtLeast(1), orientation)
             } ?: ImageMetadata(1, 1)
         } catch (_: Exception) { ImageMetadata(1, 1) }
     }
     private fun requestDetailRegion(photo: PhotoView, uri: Uri, request: DetailRequest) {
-        if (photo.hasDetailFor(request)) return
+        if (page != Page.VIEWER || pendingViewerIndex != null || photo !== viewer || photo.hasDetailFor(request)) return
         detailRequestGeneration++
         val generation = detailRequestGeneration
         detailRequestRunnable?.let(detailRequestHandler::removeCallbacks)
@@ -1398,65 +1508,48 @@ class MainActivity : Activity() {
     //  CROWN  (sensitivity halved: dp(7) → dp(3))
     // ══════════════════════════════════════════════════════════════════
 
-    private var crownDelta = 0f
-    private var crownSwitchMs = 0L
+    private val crownPages = CrownPageAccumulator(threshold = 100f)
     private var crownScrollRemainder = 0f
+
+
+
     @SuppressLint("InlinedApi")
     override fun dispatchGenericMotionEvent(e: MotionEvent): Boolean {
-        if (e.action == MotionEvent.ACTION_SCROLL) {
-            var delta = e.getAxisValue(MotionEvent.AXIS_VSCROLL)
-            if (delta == 0f) delta = e.getAxisValue(MotionEvent.AXIS_SCROLL)
-            if (delta == 0f) delta = e.getAxisValue(MotionEvent.AXIS_HSCROLL)
-            if (delta != 0f) {
-                delta = scaleCrownDelta(delta, CROWN_SENSITIVITY)
-                if (page == Page.VIEWER) {
-                    val manga = mangaViewer
-                    if (manga != null) {
-                        if (prefs.getBoolean("crownZoom", true)) {
-                            manga.zoomBy(-delta)
-                        } else {
-                            manga.scrollByDistance(-delta * dp(3f))
-                        }
-                    } else if (prefs.getBoolean("crownZoom", true)) {
-                        viewer?.zoomBy(-delta)
-                    } else {
-                        // Time-gated image switching
-                        if (crownDelta != 0f && (delta > 0f) != (crownDelta > 0f)) {
-                            crownDelta = 0f
-                        }
-                        crownDelta += delta
-                        val now = SystemClock.uptimeMillis()
-                        if (abs(crownDelta) >= 8f) {
-                            if (now - crownSwitchMs > 400) {
-                                if (crownDelta < 0f && viewerIndex + 1 < viewerPics.size) {
-                                    viewerIndex++; rotation = 0f
-                                    slideToImage(-1f)
-                                    crownSwitchMs = now
-                                } else if (crownDelta > 0f && viewerIndex - 1 >= 0) {
-                                    viewerIndex--; rotation = 0f
-                                    slideToImage(1f)
-                                    crownSwitchMs = now
-                                }
-                            }
-                            crownDelta = 0f
-                        }
-                    }
-                } else {
-                    val pixels = -delta * dp(3f) + crownScrollRemainder
-                    val step = pixels.toInt()
-                    crownScrollRemainder = pixels - step
-                    when (page) {
-                        Page.ALBUMS -> albumGrid?.scrollBy(0, step)
-                        Page.SETTINGS -> settingsScroll?.scrollBy(0, step)
-                        Page.PICK_ALBUM -> pickerScroll?.scrollBy(0, step)
-                        Page.SELECT_ALBUMS -> selectScroll?.scrollBy(0, step)
-                        else -> Unit
-                    }
+        if (e.action != MotionEvent.ACTION_SCROLL) return super.dispatchGenericMotionEvent(e)
+        var raw = e.getAxisValue(MotionEvent.AXIS_VSCROLL)
+        if (raw == 0f) raw = e.getAxisValue(MotionEvent.AXIS_SCROLL)
+        if (raw == 0f) raw = e.getAxisValue(MotionEvent.AXIS_HSCROLL)
+        val delta = scaleCrownDelta(raw, crownSensitivity)
+        if (delta == 0f) return true
+        if (page == Page.VIEWER) {
+            val manga = mangaViewer
+            if (manga != null) {
+                if (prefs.getBoolean("crownZoom", true)) manga.zoomBy(-delta)
+                else manga.scrollByDistance(-delta * dp(3f))
+            } else if (prefs.getBoolean("crownZoom", true)) {
+                viewer?.zoomBy(-delta)
+            } else if (!isExternal) {
+                val steps = crownPages.consume(delta, e.eventTime)
+                if (steps != 0) {
+                    requestImageStep(steps)
+                    val target = pendingViewerIndex ?: viewerIndex
+                    if (target == 0 || target == viewerPics.lastIndex) crownPages.reset()
                 }
-                return true
+            }
+        } else {
+            val pixels = -delta * dp(3f) + crownScrollRemainder
+            val step = pixels.toInt()
+            crownScrollRemainder = pixels - step
+            when (page) {
+                Page.ALBUMS -> albumGrid?.scrollBy(0, step)
+                Page.SETTINGS -> settingsScroll?.scrollBy(0, step)
+                Page.PICK_ALBUM -> pickerScroll?.scrollBy(0, step)
+                Page.SELECT_ALBUMS -> selectScroll?.scrollBy(0, step)
+                else -> Unit
             }
         }
-        return super.dispatchGenericMotionEvent(e)
+        // Non-standard OPPO REL_WHEEL events must not reach incompatible rotary handlers.
+        return true
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -1521,6 +1614,49 @@ class MainActivity : Activity() {
         return c.apply { layoutParams = LinearLayout.LayoutParams(-1, dp(54)).apply { setMargins(0, dp(3), 0, dp(3)) } }
     }
 
+    private fun crownSensitivityControl(): View {
+        val card = MaterialCardView(this).apply {
+            radius = dp(16).toFloat()
+            setCardBackgroundColor(surface)
+            cardElevation = 0f
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(7), dp(14), dp(5))
+        }
+        val valueLabel = label("${(crownSensitivity * 100f).roundToInt()}%", 12f, true).apply {
+            gravity = Gravity.END
+            setTextColor(accent)
+        }
+        val titleRow = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label("表冠灵敏度", 13f, true), LinearLayout.LayoutParams(0, dp(24), 1f))
+            addView(valueLabel, LinearLayout.LayoutParams(dp(52), dp(24)))
+        }
+        val slider = android.widget.SeekBar(this).apply {
+            max = 19
+            progress = ((crownSensitivity - MIN_CROWN_SENSITIVITY) /
+                (MAX_CROWN_SENSITIVITY - MIN_CROWN_SENSITIVITY) * max).roundToInt().coerceIn(0, max)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(seekBar: android.widget.SeekBar?, value: Int, fromUser: Boolean) {
+                    val sensitivity = MIN_CROWN_SENSITIVITY +
+                        (MAX_CROWN_SENSITIVITY - MIN_CROWN_SENSITIVITY) * value / max.toFloat()
+                    prefs.edit().putFloat("crownSensitivity", sensitivity).apply()
+                    valueLabel.text = "${(sensitivity * 100f).roundToInt()}%"
+                    crownPages.reset()
+                    crownScrollRemainder = 0f
+                }
+                override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) = Unit
+                override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) = Unit
+            })
+        }
+        box.addView(titleRow)
+        box.addView(slider, LinearLayout.LayoutParams(-1, dp(36)))
+        card.addView(box)
+        return card.apply {
+            layoutParams = LinearLayout.LayoutParams(-1, dp(68)).apply { setMargins(0, dp(3), 0, dp(3)) }
+        }
+    }
     private fun switchCard(title: String, value: Boolean, change: (Boolean) -> Unit): View {
         val c = MaterialCardView(this).apply {
             radius = dp(16).toFloat(); setCardBackgroundColor(surface); cardElevation = 0f
@@ -1565,6 +1701,19 @@ class MainActivity : Activity() {
         addView(label(name, 15f, true).apply { gravity = Gravity.CENTER })
     }
 
+    private fun showLicenseDialog() {
+        MaterialAlertDialogBuilder(this)
+            .setTitle("MiniPic 许可证")
+            .setMessage(
+                "Copyright (C) 2026 Mooncyer\n\n" +
+                    "MiniPic 按 GNU Affero General Public License v3.0 发布。\n\n" +
+                    "本应用按现状提供，不提供任何明示或默示担保。完整许可证文本位于源码仓库根目录的 LICENSE 文件：\n" +
+                    "https://github.com/Mooncyer/MiniPic/blob/master/LICENSE"
+            )
+            .setPositiveButton("关闭", null)
+            .show()
+    }
+
     private fun newAlbum() {
         val input = EditText(this).apply { hint = "相册名称"; setSingleLine() }
         MaterialAlertDialogBuilder(this)
@@ -1599,12 +1748,9 @@ class MainActivity : Activity() {
                 ImageDecoder.createSource(File(uri.path!!))
             else ImageDecoder.createSource(contentResolver, uri)
             ImageDecoder.decodeDrawable(source) { decoder, info, _ ->
-                val width = info.size.width.coerceAtLeast(1)
-                val height = info.size.height.coerceAtLeast(1)
-                val factor = minOf(1f, maxWidth.toFloat() / width, maxHeight.toFloat() / height)
-                if (factor < 1f) {
-                    decoder.setTargetSize(max(1, (width * factor).roundToInt()),
-                        max(1, (height * factor).roundToInt()))
+                val target = fittedPreviewSize(info.size.width, info.size.height, maxWidth, maxHeight)
+                if (target.first != info.size.width || target.second != info.size.height) {
+                    decoder.setTargetSize(target.first, target.second)
                 }
                 decoder.isMutableRequired = false
             }
@@ -1678,14 +1824,14 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        detailRequestGeneration++
-        detailRequestFuture?.cancel(true)
-        detailRequestHandler.removeCallbacksAndMessages(null)
-        imageLoadGeneration++
+        cancelViewerLoads()
+        crownPages.reset()
+        viewer?.setPlaybackActive(false)
         io.shutdownNow()
         fileIo.shutdownNow()
         coverIo.shutdownNow()
         viewerIo.shutdownNow()
+        imageIo.shutdownNow()
         synchronized(coverCache) { coverCache.clear() }
     }
 }
@@ -1708,9 +1854,17 @@ class GestureFrameLayout(context: Context) : FrameLayout(context) {
     private val edgeThresh get() = (24 * resources.displayMetrics.density).toInt()
     private val moveThresh get() = (20 * resources.displayMetrics.density).toInt()
 
-    override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
-        touchObserver?.invoke(event)
+    private var edgeEligible = false
 
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) edgeEligible = event.pointerCount == 1
+        if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN ||
+            event.actionMasked == MotionEvent.ACTION_CANCEL) edgeEligible = false
+        touchObserver?.invoke(event)
+        return super.dispatchTouchEvent(event)
+    }
+
+    override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX = event.x
@@ -1718,6 +1872,7 @@ class GestureFrameLayout(context: Context) : FrameLayout(context) {
             }
             MotionEvent.ACTION_MOVE -> {
                 val dx = event.x - downX
+                if (!edgeEligible || abs(dx) <= abs(event.y - downY)) return false
                 // Left edge → right swipe (back)
                 if (downX < edgeThresh && dx > moveThresh) return true
                 // Right edge → left swipe (enter)
@@ -1733,7 +1888,8 @@ class GestureFrameLayout(context: Context) : FrameLayout(context) {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (event.actionMasked == MotionEvent.ACTION_UP) {
+        if (event.actionMasked == MotionEvent.ACTION_UP && edgeEligible) {
+            edgeEligible = false
             val dx = event.x - downX
             val fromLeft = downX < edgeThresh
             swipeObserver?.invoke(dx, fromLeft)
@@ -1791,13 +1947,52 @@ class PhotoView(context: Context) : View(context) {
     }
 
     fun setDrawable(value: Drawable?) {
+        (drawable as? Animatable)?.stop()
+        drawable?.callback = null
         drawable = value
+        drawable?.callback = this
         userScale = 1f
         tx = 0f
         ty = 0f
         clearDetailBitmap()
         updateFitScale()
         invalidate()
+        updatePlayback()
+    }
+
+    override fun verifyDrawable(who: Drawable): Boolean = who === drawable || super.verifyDrawable(who)
+
+    override fun invalidateDrawable(who: Drawable) {
+        if (who === drawable) postInvalidateOnAnimation() else super.invalidateDrawable(who)
+    }
+
+    private var playbackActive = true
+
+    fun setPlaybackActive(active: Boolean) {
+        playbackActive = active
+        updatePlayback()
+    }
+
+    private fun updatePlayback() {
+        val animation = drawable as? Animatable ?: return
+        if (playbackActive && isShown && isAttachedToWindow && windowVisibility == View.VISIBLE) animation.start()
+        else animation.stop()
+    }
+
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        updatePlayback()
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        updatePlayback()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        drawable?.callback = this
+        updatePlayback()
     }
 
     fun hasDetailFor(request: DetailRequest): Boolean =
@@ -1832,6 +2027,8 @@ class PhotoView(context: Context) : View(context) {
         updateFitScale()
         requestDetailUpdate()
     }
+
+    fun hasImage() = drawable != null
 
     fun isAtFitScale() = userScale <= 1.015f
 
@@ -1890,8 +2087,14 @@ class PhotoView(context: Context) : View(context) {
 
     private fun drawPreview(canvas: Canvas) {
         val preview = drawable ?: return
-        preview.setBounds(-sourceWidth / 2, -sourceHeight / 2, sourceWidth / 2, sourceHeight / 2)
+        val previewWidth = preview.intrinsicWidth.coerceAtLeast(1)
+        val previewHeight = preview.intrinsicHeight.coerceAtLeast(1)
+        canvas.save()
+        canvas.translate(-sourceWidth / 2f, -sourceHeight / 2f)
+        canvas.scale(sourceWidth.toFloat() / previewWidth, sourceHeight.toFloat() / previewHeight)
+        preview.setBounds(0, 0, previewWidth, previewHeight)
         preview.draw(canvas)
+        canvas.restore()
     }
 
     private fun drawDetail(canvas: Canvas) {
@@ -1934,14 +2137,23 @@ class PhotoView(context: Context) : View(context) {
                 lastY = event.y
                 dragging = userScale > 1.015f
             }
-            MotionEvent.ACTION_MOVE -> if (dragging && !scaleDetector.isInProgress) {
-                tx += event.x - lastX
-                ty += event.y - lastY
+            MotionEvent.ACTION_POINTER_DOWN -> dragging = false
+            MotionEvent.ACTION_POINTER_UP -> {
+                val remaining = if (event.actionIndex == 0) 1 else 0
+                lastX = event.getX(remaining)
+                lastY = event.getY(remaining)
+                dragging = userScale > 1.015f
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (dragging && !scaleDetector.isInProgress && event.pointerCount == 1) {
+                    tx += event.x - lastX
+                    ty += event.y - lastY
+                    clamp()
+                    invalidate()
+                    requestDetailUpdate()
+                }
                 lastX = event.x
                 lastY = event.y
-                clamp()
-                invalidate()
-                requestDetailUpdate()
             }
             MotionEvent.ACTION_UP -> { dragging = false; performClick() }
             MotionEvent.ACTION_CANCEL -> dragging = false
@@ -1958,6 +2170,12 @@ class PhotoView(context: Context) : View(context) {
     }
 
     override fun onDetachedFromWindow() {
+        animate().cancel()
+        (drawable as? Animatable)?.stop()
+        drawable?.let { unscheduleDrawable(it) }
+        drawable?.callback = null
+        drawable = null
+        onViewportChanged = null
         clearDetailBitmap()
         super.onDetachedFromWindow()
     }

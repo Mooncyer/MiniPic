@@ -2,23 +2,34 @@
 keystore.properties
 *.jks
 *.keystore
+*.p12
 
 # Test extraction/output
 .manga-test/
 
 # Android/Gradle
 .gradle/
+**/.gradle/
 **/build/
+**/.cxx/
 local.properties
 
 # IDE
 .idea/
+.vscode/
 *.iml
 
-# Outputs
+# Outputs and local release staging
 *.apk
 *.aab
 *.zip
+/dist/
+**/dist/
+/release/
 
-# Local runtime/cache
+# OS and local runtime/cache
+.DS_Store
+Thumbs.db
 *.log
+*.tmp
+*.bak

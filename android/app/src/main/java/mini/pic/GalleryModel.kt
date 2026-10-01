@@ -46,7 +46,45 @@ internal class GalleryScanner(
     }
 }
 
-internal fun scaleCrownDelta(delta: Float, sensitivity: Float = 0.4f): Float = delta * sensitivity
+internal const val DEFAULT_CROWN_SENSITIVITY = 0.4f
+internal const val MIN_CROWN_SENSITIVITY = 0.1f
+internal const val MAX_CROWN_SENSITIVITY = 2f
+
+internal fun validCrownSensitivity(value: Float): Float =
+    if (value.isFinite()) value.coerceIn(MIN_CROWN_SENSITIVITY, MAX_CROWN_SENSITIVITY)
+    else DEFAULT_CROWN_SENSITIVITY
+
+internal fun scaleCrownDelta(delta: Float, sensitivity: Float = DEFAULT_CROWN_SENSITIVITY): Float =
+    if (delta.isFinite()) delta * validCrownSensitivity(sensitivity) else 0f
+
+internal class CrownPageAccumulator(private val threshold: Float = 8f) {
+    private var remainder = 0f
+
+    fun reset() {
+        remainder = 0f
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    fun consume(delta: Float, eventTime: Long): Int {
+        if (!delta.isFinite() || delta == 0f) return 0
+        if (remainder != 0f && (delta > 0f) != (remainder > 0f)) remainder = 0f
+        remainder += delta
+        val steps = (remainder / threshold).toInt()
+        remainder -= steps * threshold
+        return -steps
+    }
+}
+
+internal fun requestedPageIndex(index: Int, steps: Int, size: Int): Int =
+    if (size <= 0) 0 else (index.toLong() + steps).coerceIn(0L, size.toLong() - 1).toInt()
+
+internal fun fittedPreviewSize(width: Int, height: Int, maxWidth: Int, maxHeight: Int): Pair<Int, Int> {
+    val w = width.coerceAtLeast(1)
+    val h = height.coerceAtLeast(1)
+    val factor = minOf(1f, maxWidth.coerceAtLeast(1).toFloat() / w, maxHeight.coerceAtLeast(1).toFloat() / h)
+    return maxOf(1, kotlin.math.round(w * factor).toInt()) to
+        maxOf(1, kotlin.math.round(h * factor).toInt())
+}
 
 internal fun groupGalleryImages(images: List<Pic>, includeHidden: Boolean): LinkedHashMap<String, MutableList<Pic>> {
     val grouped = linkedMapOf<String, MutableList<Pic>>()

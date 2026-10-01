@@ -1,0 +1,18 @@
+* text=auto eol=lf
+
+# Keep platform scripts usable after checkout.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets and generated packages.
+*.apk binary
+*.aab binary
+*.gif binary
+*.jar binary
+*.jks binary
+*.jpeg binary
+*.jpg binary
+*.keystore binary
+*.png binary
+*.psd binary
+*.zip binary
