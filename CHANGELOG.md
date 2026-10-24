@@ -2,6 +2,18 @@
 
 MiniPic follows a lightweight release history. Detailed device and verification notes remain in [`docs/maintenance/DEVELOPMENT_STATUS.md`](docs/maintenance/DEVELOPMENT_STATUS.md).
 
+## [0.0.8] - 2026-10-24
+
+### Changed
+
+- Crown zoom in both single-image and manga modes anchors at the screen center; double-tap-and-slide zoom anchors at the second press, and pinch zoom anchors at the two-finger midpoint while following midpoint movement.
+
+### Verification
+
+- 39 JVM unit tests and 16 OWW211 instrumentation tests passed.
+- Android Lint completed with 0 errors and 16 warnings; Debug, Release, and instrumentation APKs built successfully.
+- Universal, `armeabi-v7a`, and `arm64-v8a` Release APKs passed `apksigner verify` with the long-term release certificate.
+
 ## [0.0.7] - 2026-10-01
 
 ### Added

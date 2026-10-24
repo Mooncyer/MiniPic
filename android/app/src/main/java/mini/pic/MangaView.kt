@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.view.GestureDetector
 import android.view.MotionEvent
 import android.widget.OverScroller
 import android.view.ScaleGestureDetector
@@ -23,6 +24,29 @@ interface ViewerSurface {
 }
 
 data class MangaPageMetrics(val width: Int, val height: Int)
+
+data class MangaZoomState(val zoom: Float, val panX: Float, val contentOffset: Float)
+
+internal fun mangaZoomState(
+    state: MangaZoomState,
+    viewportWidth: Float,
+    targetZoom: Float,
+    anchorX: Float,
+    anchorY: Float,
+    targetX: Float = anchorX,
+    targetY: Float = anchorY
+): MangaZoomState {
+    val boundedZoom = targetZoom.coerceIn(.5f, 4f)
+    val factor = boundedZoom / state.zoom
+    if (!factor.isFinite() || factor <= 0f) return state.copy(zoom = boundedZoom)
+    val contentX = (anchorX - viewportWidth / 2f - state.panX) / state.zoom + viewportWidth / 2f
+    val contentY = (anchorY + state.contentOffset) / state.zoom
+    return MangaZoomState(
+        boundedZoom,
+        targetX - viewportWidth / 2f - (contentX - viewportWidth / 2f) * boundedZoom,
+        contentY * boundedZoom - targetY
+    )
+}
 
 class MangaView(
     context: android.content.Context,
@@ -43,6 +67,12 @@ class MangaView(
     private var lastX = 0f
     private var lastY = 0f
     private var dragging = false
+    private var doubleTapZooming = false
+    private var doubleTapAnchorX = 0f
+    private var doubleTapAnchorY = 0f
+    private var lastDoubleTapY = 0f
+    private var pinchFocusX = 0f
+    private var pinchFocusY = 0f
     private var velocityTracker: VelocityTracker? = null
     private val scroller = OverScroller(context)
     private var generation = 0L
@@ -51,12 +81,55 @@ class MangaView(
     private var layoutReady = false
     var onPageChanged: ((Int) -> Unit)? = null
     private var currentPage = -1
+
+    private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(event: MotionEvent): Boolean = true
+
+        override fun onDoubleTap(event: MotionEvent): Boolean {
+            if (scaleDetector.isInProgress) return false
+            doubleTapZooming = true
+            return true
+        }
+
+        override fun onDoubleTapEvent(event: MotionEvent): Boolean {
+            if (!doubleTapZooming) return false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    doubleTapAnchorX = event.x
+                    doubleTapAnchorY = event.y
+                    lastDoubleTapY = event.y
+                }
+                MotionEvent.ACTION_MOVE -> if (event.pointerCount == 1) {
+                    val logScale = (lastDoubleTapY - event.y) * DOUBLE_TAP_ZOOM_RATE
+                    lastDoubleTapY = event.y
+                    if (logScale != 0f) {
+                        applyScale(zoom * exp(logScale), doubleTapAnchorX, doubleTapAnchorY)
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> doubleTapZooming = false
+            }
+            return true
+        }
+    })
+
     private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+            doubleTapZooming = false
+            pinchFocusX = detector.focusX
+            pinchFocusY = detector.focusY
+            return true
+        }
+
         override fun onScale(detector: ScaleGestureDetector): Boolean {
-            zoom = (zoom * detector.scaleFactor).coerceIn(.5f, 4f)
-            clampPosition()
-            invalidate()
-            scheduleVisibleLoads()
+            applyScale(
+                zoom * detector.scaleFactor,
+                pinchFocusX,
+                pinchFocusY,
+                detector.focusX,
+                detector.focusY
+            )
+            pinchFocusX = detector.focusX
+            pinchFocusY = detector.focusY
             return true
         }
     })
@@ -114,7 +187,28 @@ class MangaView(
 
     override fun zoomBy(delta: Float) {
         scroller.abortAnimation()
-        zoom = (zoom * exp(delta * .055f)).coerceIn(.5f, 4f)
+        applyScale(zoom * exp(delta * .055f), width / 2f, height / 2f)
+    }
+
+    private fun applyScale(
+        targetZoom: Float,
+        anchorX: Float,
+        anchorY: Float,
+        targetX: Float = anchorX,
+        targetY: Float = anchorY
+    ) {
+        val state = mangaZoomState(
+            MangaZoomState(zoom, panX, contentOffset),
+            width.toFloat(),
+            targetZoom,
+            anchorX,
+            anchorY,
+            targetX,
+            targetY
+        )
+        zoom = state.zoom
+        panX = state.panX
+        contentOffset = state.contentOffset
         clampPosition()
         invalidate()
         scheduleVisibleLoads()
@@ -134,6 +228,7 @@ class MangaView(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        gestureDetector.onTouchEvent(event)
         scaleDetector.onTouchEvent(event)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
@@ -143,9 +238,20 @@ class MangaView(
                 velocityTracker?.addMovement(event)
                 lastX = event.x
                 lastY = event.y
+                dragging = !doubleTapZooming
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                doubleTapZooming = false
+                dragging = false
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                doubleTapZooming = false
+                val remaining = if (event.actionIndex == 0) 1 else 0
+                lastX = event.getX(remaining)
+                lastY = event.getY(remaining)
                 dragging = true
             }
-            MotionEvent.ACTION_MOVE -> if (dragging && !scaleDetector.isInProgress) {
+            MotionEvent.ACTION_MOVE -> if (dragging && !doubleTapZooming && !scaleDetector.isInProgress && event.pointerCount == 1) {
                 velocityTracker?.addMovement(event)
                 val dx = event.x - lastX
                 val dy = event.y - lastY
@@ -174,6 +280,7 @@ class MangaView(
                 velocityTracker?.recycle()
                 velocityTracker = null
                 dragging = false
+                doubleTapZooming = false
             }
         }
         return true
@@ -226,7 +333,6 @@ class MangaView(
         }
         return low.coerceAtMost(pages.size)
     }
-
 
     private fun scheduleVisibleLoads() {
         if (width <= 0 || pages.isEmpty() || !layoutReady) return

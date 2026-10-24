@@ -16,7 +16,7 @@ MiniPic is a native Android gallery and comic reader designed for smartwatches, 
 | --- | --- |
 | 应用名称 | MiniPic / 图库 |
 | Application ID | `mini.pic` |
-| 当前版本 | `0.0.7` / `versionCode 7` |
+| 当前版本 | `0.0.8` / `versionCode 8` |
 | 主要设备 | OPPO Watch OWW211，Android 11，378 × 496 |
 | 最低系统 | Android API 23 |
 | 编译 / 目标 SDK | 35 / 35 |
@@ -25,7 +25,7 @@ MiniPic is a native Android gallery and comic reader designed for smartwatches, 
 | 支持 ABI | `armeabi-v7a`、`arm64-v8a`、Universal |
 | 许可证 | [GNU AGPL-3.0](LICENSE) |
 
-这是一个仍在持续开发中的个人项目。0.0.7 已通过 36 项 JVM 测试、12 项 OWW211 instrumentation 测试、Android Lint、Debug/Release 构建，并在手表上完成签名覆盖安装和主要交互验证。实体表冠的机械手感仍需手动验收。应用尚未发布到应用商店，也不承诺适配所有 Android 手表型号。
+这是一个仍在持续开发中的个人项目。0.0.8 已通过 39 项 JVM 测试、16 项 OWW211 instrumentation 测试、Android Lint、Debug/Release 构建，并在手表上完成同签名覆盖安装与回归验证；实体表冠的机械手感仍需手动验收。应用尚未发布到应用商店，也不承诺适配所有 Android 手表型号。
 
 ## 功能
 
@@ -39,7 +39,7 @@ MiniPic is a native Android gallery and comic reader designed for smartwatches, 
 
 ### 单图查看
 
-- 支持缩放、平移和连续切换图片。
+- 支持缩放、平移和连续切换图片；表冠以屏幕中心、双击后滑动以第二次触点、双指缩放以两指中点作为缩放锚点。
 - 处理 EXIF 方向，避免旋转照片显示方向错误。
 - 高倍率查看时按当前视口解码图片区域，降低大图一次性加载的内存压力。
 - 支持复制、移动、删除、临时旋转和设置封面等文件操作。
@@ -50,7 +50,7 @@ MiniPic is a native Android gallery and comic reader designed for smartwatches, 
 
 - 按自然数字顺序排列文件名，例如 `1、2、10`，不会按字典序变成 `1、10、2`。
 - 将相册内图片按屏幕宽度纵向连续拼接，适合阅读连续漫画页面。
-- 支持触摸拖动、惯性滚动和缩放。
+- 支持触摸拖动、惯性滚动和缩放；表冠以屏幕中心、双击滑动以第二次按压点、双指缩放以双指中点作为锚点。
 - 只异步加载当前视口及附近页面，并回收远离视口的 Bitmap。
 - 可设置表冠用于漫画缩放，或关闭缩放后用于滚动漫画内容。
 

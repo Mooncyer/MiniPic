@@ -36,6 +36,7 @@ import kotlin.math.*
 private const val SIGNATURE = GALLERY_SIGNATURE
 private const val REGION_OVERSCAN = 1.25f
 private const val REGION_PIXEL_BUDGET = 4_000_000
+internal const val DOUBLE_TAP_ZOOM_RATE = 0.005f
 internal const val IMAGE_SWITCH_ANIM_DURATION_MS = 150L
 
 data class DetailRequest(
@@ -1921,16 +1922,64 @@ class PhotoView(context: Context) : View(context) {
     private var lastX = 0f
     private var lastY = 0f
     private var dragging = false
+    private var doubleTapZooming = false
+    private var doubleTapAnchorX = 0f
+    private var doubleTapAnchorY = 0f
+    private var lastDoubleTapY = 0f
+    private var pinchFocusX = 0f
+    private var pinchFocusY = 0f
     private var detailToken = 0L
 
     var onViewportChanged: ((DetailRequest) -> Unit)? = null
 
+    private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
+        override fun onDown(event: MotionEvent): Boolean = true
+
+        override fun onDoubleTap(event: MotionEvent): Boolean {
+            if (scaleDetector.isInProgress) return false
+            doubleTapZooming = true
+            return true
+        }
+
+        override fun onDoubleTapEvent(event: MotionEvent): Boolean {
+            if (!doubleTapZooming) return false
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    doubleTapAnchorX = event.x
+                    doubleTapAnchorY = event.y
+                    lastDoubleTapY = event.y
+                }
+                MotionEvent.ACTION_MOVE -> if (event.pointerCount == 1) {
+                    val logScale = (lastDoubleTapY - event.y) * DOUBLE_TAP_ZOOM_RATE
+                    lastDoubleTapY = event.y
+                    if (logScale != 0f) {
+                        applyScale(userScale * exp(logScale), doubleTapAnchorX, doubleTapAnchorY)
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> doubleTapZooming = false
+            }
+            return true
+        }
+    })
+
     private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+            doubleTapZooming = false
+            pinchFocusX = detector.focusX
+            pinchFocusY = detector.focusY
+            return true
+        }
+
         override fun onScale(detector: ScaleGestureDetector): Boolean {
-            userScale = (userScale * detector.scaleFactor).coerceIn(.1f, 20f)
-            clamp()
-            invalidate()
-            requestDetailUpdate()
+            applyScale(
+                userScale * detector.scaleFactor,
+                pinchFocusX,
+                pinchFocusY,
+                detector.focusX,
+                detector.focusY
+            )
+            pinchFocusX = detector.focusX
+            pinchFocusY = detector.focusY
             return true
         }
     })
@@ -2033,7 +2082,24 @@ class PhotoView(context: Context) : View(context) {
     fun isAtFitScale() = userScale <= 1.015f
 
     fun zoomBy(delta: Float) {
-        userScale = (userScale * exp(delta * .055f)).coerceIn(.1f, 20f)
+        val targetScale = (userScale * exp(delta * .055f)).coerceIn(.1f, 20f)
+        applyScale(targetScale, width / 2f, height / 2f)
+    }
+
+    private fun applyScale(
+        targetScale: Float,
+        anchorX: Float,
+        anchorY: Float,
+        targetX: Float = anchorX,
+        targetY: Float = anchorY
+    ) {
+        val boundedScale = targetScale.coerceIn(.1f, 20f)
+        val factor = boundedScale / userScale
+        if (factor.isFinite() && factor > 0f) {
+            tx = targetX - width / 2f - (anchorX - width / 2f - tx) * factor
+            ty = targetY - height / 2f - (anchorY - height / 2f - ty) * factor
+        }
+        userScale = boundedScale
         clamp()
         invalidate()
         requestDetailUpdate()
@@ -2130,22 +2196,27 @@ class PhotoView(context: Context) : View(context) {
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        gestureDetector.onTouchEvent(event)
         scaleDetector.onTouchEvent(event)
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 lastX = event.x
                 lastY = event.y
-                dragging = userScale > 1.015f
+                dragging = userScale > 1.015f && !doubleTapZooming
             }
-            MotionEvent.ACTION_POINTER_DOWN -> dragging = false
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                doubleTapZooming = false
+                dragging = false
+            }
             MotionEvent.ACTION_POINTER_UP -> {
+                doubleTapZooming = false
                 val remaining = if (event.actionIndex == 0) 1 else 0
                 lastX = event.getX(remaining)
                 lastY = event.getY(remaining)
                 dragging = userScale > 1.015f
             }
             MotionEvent.ACTION_MOVE -> {
-                if (dragging && !scaleDetector.isInProgress && event.pointerCount == 1) {
+                if (dragging && !doubleTapZooming && !scaleDetector.isInProgress && event.pointerCount == 1) {
                     tx += event.x - lastX
                     ty += event.y - lastY
                     clamp()
@@ -2156,7 +2227,7 @@ class PhotoView(context: Context) : View(context) {
                 lastY = event.y
             }
             MotionEvent.ACTION_UP -> { dragging = false; performClick() }
-            MotionEvent.ACTION_CANCEL -> dragging = false
+            MotionEvent.ACTION_CANCEL -> { dragging = false; doubleTapZooming = false }
         }
         return true
     }

@@ -1,7 +1,7 @@
 # MiniPic 开发状态
 
-最后验证：2026-10-01；0.0.7 构建、签名和 OWW211 回归完成。
-当前开发版本：0.0.7（versionCode 7）
+最后验证：2026-10-24；0.0.8 构建、签名和 OWW211 回归完成。
+当前开发版本：0.0.8（versionCode 8）
 工程目录：仓库中的 `android/`。
 
 ## 项目定位
@@ -19,6 +19,13 @@ MiniPic 是面向 Android 手表、优先适配 OPPO Watch OWW211 的原生图�
 - 源码入口 `android/app/src/main/java/mini/pic/MainActivity.kt`；扫描/排序在 `GalleryModel.kt`，漫画画布在 `MangaView.kt`。
 
 ## 本轮已完成
+
+### 图片缩放（0.0.8）
+
+- 普通单图与漫画模式的表冠缩放都以屏幕中心为锚点，并同步更新平移量。
+- 两种查看模式的双击后滑动缩放都以第二次按压位置为固定锚点；上滑放大、下滑缩小。
+- 双指缩放以两指中点为锚点，并把中点移动应用为同步平移。
+- 新增 JVM 坐标测试及 OWW211 仪器回归，覆盖两种查看模式的三类锚点。
 
 ### 数据完整性
 
@@ -78,7 +85,15 @@ MiniPic 是面向 Android 手表、优先适配 OPPO Watch OWW211 的原生图�
 - 未补零自然数字顺序（1, 2, 10）和混合文本数字文件名。
 - 漫画单页目标尺寸/2MP Bitmap 预算。
 
-36 项 JVM 测试全部通过。`ViewerRegressionTest` 在 OWW211/API 30 上运行 12 项 instrumentation 测试，全部通过，覆盖标题退出、离页取消、快速目标/反向/边界、上下滑动方向及动画中断接续、表冠100阈值与达到后立即切图、触摸和表冠共用切图流程、失败加载的显示/URI 一致性、GIF fit/换帧/暂停恢复、三滚动轴、取消触摸及滑块保存。`fit-small.gif`（32×16）和 `fit-large.gif`（1200×800）为两帧红/绿循环素材，每帧 180ms。测试仅创建唯一 cache 目录，结束后清理并恢复设置；临时 runner 已从手表移除。
+39 项 JVM 测试全部通过。`ViewerRegressionTest` 在 OWW211/API 30 上运行 16 项 instrumentation 测试，全部通过，覆盖标题退出、离页取消、快速目标/反向/边界、上下动画方向及中断接续、表冠100阈值与立即切图、失败加载的显示/URI 一致性、GIF fit/换帧/暂停恢复、三滚动轴、取消触摸、滑块保存，以及普通单图和漫画模式的表冠中心、双击第二次触点、双指中点和中点移动锚定。`fit-small.gif`（32×16）和 `fit-large.gif`（1200×800）为两帧红/绿循环素材，每帧 180ms。测试仅创建唯一 cache 目录，结束后清理并恢复设置；测试 runner 已从手表移除。
+
+## 0.0.8 验证状态
+
+- `testDebugUnitTest lintDebug assembleDebug assembleRelease assembleDebugAndroidTest`：BUILD SUCCESSFUL；39 项 JVM 测试通过，Lint 0 errors / 16 warnings。
+- 16 项 OWW211/API 30 instrumentation 测试全部通过，包含普通单图与漫画模式的表冠中心、双击第二次触点、双指中点和中点移动锚定验证。
+- Universal、armeabi-v7a、arm64-v8a Release 均通过 `apksigner verify`，并使用与 0.0.7 相同的长期发布证书。
+- OWW211 从 0.0.7 同签名覆盖安装至 versionCode 8，保留应用数据；回归完成后恢复正式 Release，测试 runner 已移除，测试设置已恢复。
+- 真实表冠的方向、机械刻度与手感仍需人工验收。
 
 ## 0.0.7 验证状态
 

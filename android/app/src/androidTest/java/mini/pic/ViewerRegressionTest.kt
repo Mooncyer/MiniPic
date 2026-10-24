@@ -204,6 +204,158 @@ class ViewerRegressionTest {
             }
     }
 
+    @Test fun crownZoomKeepsViewportCenterAnchored() {
+        main {
+            configurePhotoForZoom()
+            val view = photo()
+            view.zoomBy(12f)
+            val now = SystemClock.uptimeMillis()
+            val x = view.width / 2f
+            val y = view.height / 2f
+            sendPhotoTouch(MotionEvent.ACTION_DOWN, now, now, x, y)
+            sendPhotoTouch(MotionEvent.ACTION_MOVE, now, now + 30, x + 32f, y + 24f)
+            sendPhotoTouch(MotionEvent.ACTION_UP, now, now + 50, x + 32f, y + 24f)
+        }
+        val center = main { photo().width / 2f to photo().height / 2f }
+        val before = imagePointAt(center.first, center.second)
+        main { photo().zoomBy(8f) }
+        val after = imagePointAt(center.first, center.second)
+        assertEquals(before.first, after.first, .01f)
+        assertEquals(before.second, after.second, .01f)
+    }
+
+    @Test fun doubleTapSlideZoomAnchorsAtSecondPress() {
+        main { configurePhotoForZoom() }
+        val x = main { photo().width * .28f }
+        val y = main { photo().height * .32f }
+        val firstDown = SystemClock.uptimeMillis()
+        val secondDown = firstDown + 100
+        val secondX = x + 3f
+        val secondY = y + 3f
+        main {
+            sendPhotoTouch(MotionEvent.ACTION_DOWN, firstDown, firstDown, x, y)
+            sendPhotoTouch(MotionEvent.ACTION_UP, firstDown, firstDown + 40, x, y)
+            sendPhotoTouch(MotionEvent.ACTION_DOWN, secondDown, secondDown, secondX, secondY)
+        }
+        val before = imagePointAt(secondX, secondY)
+        main {
+            sendPhotoTouch(MotionEvent.ACTION_MOVE, secondDown, secondDown + 80, secondX, secondY - 80f)
+        }
+        val after = imagePointAt(secondX, secondY)
+        assertTrue(main { photoFieldFloat("userScale") } > 1f)
+        assertEquals(before.first, after.first, .01f)
+        assertEquals(before.second, after.second, .01f)
+        main { sendPhotoTouch(MotionEvent.ACTION_UP, secondDown, secondDown + 100, secondX, secondY - 80f) }
+    }
+
+    @Test fun pinchZoomAnchorsAtAndTracksFingerMidpoint() {
+        main { configurePhotoForZoom() }
+        val downTime = SystemClock.uptimeMillis()
+        val oldFocusX = 140f
+        val oldFocusY = 220f
+        val before = imagePointAt(oldFocusX, oldFocusY)
+        val configuration = android.view.ViewConfiguration.get(target)
+        val minimumSpan = if (android.os.Build.VERSION.SDK_INT >= 29)
+            configuration.scaledMinimumScalingSpan.toFloat() else 0f
+        val spanSlop = configuration.scaledTouchSlop * 2f
+        val triggerSpan = maxOf(120f, minimumSpan + spanSlop + 32f, 80f + spanSlop + 32f)
+        val finalSpan = triggerSpan * 1.5f
+        main {
+            sendMultiTouch(
+                MotionEvent.ACTION_DOWN, downTime, downTime,
+                listOf((oldFocusX - 40f) to oldFocusY)
+            )
+            sendMultiTouch(
+                MotionEvent.ACTION_POINTER_DOWN, downTime, downTime + 10,
+                pinchPoints(oldFocusX, oldFocusY, 80f), actionIndex = 1
+            )
+            sendMultiTouch(
+                MotionEvent.ACTION_MOVE, downTime, downTime + 40,
+                pinchPoints(oldFocusX, oldFocusY, triggerSpan)
+            )
+            sendMultiTouch(
+                MotionEvent.ACTION_MOVE, downTime, downTime + 50,
+                pinchPoints(oldFocusX + 10f, oldFocusY + 10f, finalSpan)
+            )
+            sendMultiTouch(
+                MotionEvent.ACTION_POINTER_UP, downTime, downTime + 60,
+                pinchPoints(oldFocusX + 10f, oldFocusY + 10f, finalSpan), actionIndex = 1
+            )
+            sendMultiTouch(
+                MotionEvent.ACTION_UP, downTime, downTime + 70,
+                listOf((oldFocusX + 10f - finalSpan / 2f) to (oldFocusY + 10f))
+            )
+        }
+        val after = imagePointAt(oldFocusX + 10f, oldFocusY + 10f)
+        assertTrue(main { photoFieldFloat("userScale") } > 1.2f)
+        assertEquals(before.first, after.first, .05f)
+        assertEquals(before.second, after.second, .05f)
+    }
+
+    @Test fun mangaZoomKeepsCrownDoubleTapAndPinchAnchors() {
+        val view = showManga()
+        await { view.width > 0 && mangaFieldBoolean("layoutReady") }
+        val viewportWidth = main { view.width.toFloat() }
+        val viewportHeight = main { view.height.toFloat() }
+        main {
+            setMangaField("zoom", 1.5f)
+            setMangaField("contentOffset", 400f)
+            setMangaField("panX", -20f)
+        }
+        val centerX = viewportWidth / 2f
+        val centerY = viewportHeight / 2f
+        val beforeCrown = mangaContentPoint(mangaState(), viewportWidth, centerX, centerY)
+        main { view.zoomBy(.8f) }
+        val afterCrown = mangaScreenPoint(mangaState(), viewportWidth, beforeCrown.first, beforeCrown.second)
+        assertEquals(centerX, afterCrown.first, .05f)
+        assertEquals(centerY, afterCrown.second, .05f)
+
+        val anchorX = 90f
+        val anchorY = 320f
+        val firstDown = SystemClock.uptimeMillis()
+        val secondDown = firstDown + 100
+        val beforeDoubleTap = mangaContentPoint(mangaState(), viewportWidth, anchorX, anchorY)
+        main {
+            sendViewTouch(view, MotionEvent.ACTION_DOWN, firstDown, firstDown, anchorX, anchorY)
+            sendViewTouch(view, MotionEvent.ACTION_UP, firstDown, firstDown + 40, anchorX, anchorY)
+            sendViewTouch(view, MotionEvent.ACTION_DOWN, secondDown, secondDown, anchorX, anchorY)
+            sendViewTouch(view, MotionEvent.ACTION_MOVE, secondDown, secondDown + 80, anchorX, anchorY - 60f)
+        }
+        val afterDoubleTap = mangaScreenPoint(mangaState(), viewportWidth, beforeDoubleTap.first, beforeDoubleTap.second)
+        assertTrue(main { mangaFieldFloat("zoom") } > 1.5f)
+        assertEquals(anchorX, afterDoubleTap.first, .1f)
+        assertEquals(anchorY, afterDoubleTap.second, .1f)
+        main { sendViewTouch(view, MotionEvent.ACTION_UP, secondDown, secondDown + 100, anchorX, anchorY - 60f) }
+
+        val oldMidpoint = 112f to 184f
+        val newMidpoint = 154f to 231f
+        val beforePinch = mangaContentPoint(mangaState(), viewportWidth, oldMidpoint.first, oldMidpoint.second)
+        val downTime = SystemClock.uptimeMillis()
+        val configuration = android.view.ViewConfiguration.get(target)
+        val minimumSpan = if (android.os.Build.VERSION.SDK_INT >= 29)
+            configuration.scaledMinimumScalingSpan.toFloat() else 0f
+        val triggerSpan = maxOf(120f, minimumSpan + configuration.scaledTouchSlop * 2f + 32f)
+        val finalSpan = triggerSpan * 1.5f
+        main {
+            sendMultiTouch(view, MotionEvent.ACTION_DOWN, downTime, downTime,
+                listOf((oldMidpoint.first - 40f) to oldMidpoint.second))
+            sendMultiTouch(view, MotionEvent.ACTION_POINTER_DOWN, downTime, downTime + 10,
+                pinchPoints(oldMidpoint.first, oldMidpoint.second, 80f), actionIndex = 1)
+            sendMultiTouch(view, MotionEvent.ACTION_MOVE, downTime, downTime + 40,
+                pinchPoints(oldMidpoint.first, oldMidpoint.second, triggerSpan))
+            sendMultiTouch(view, MotionEvent.ACTION_MOVE, downTime, downTime + 50,
+                pinchPoints(newMidpoint.first, newMidpoint.second, finalSpan))
+            sendMultiTouch(view, MotionEvent.ACTION_POINTER_UP, downTime, downTime + 60,
+                pinchPoints(newMidpoint.first, newMidpoint.second, finalSpan), actionIndex = 1)
+            sendMultiTouch(view, MotionEvent.ACTION_UP, downTime, downTime + 70,
+                listOf((newMidpoint.first - finalSpan / 2f) to newMidpoint.second))
+        }
+        val afterPinch = mangaScreenPoint(mangaState(), viewportWidth, beforePinch.first, beforePinch.second)
+        assertTrue(main { mangaFieldFloat("zoom") } > 2f)
+        assertEquals(newMidpoint.first, afterPinch.first, .1f)
+        assertEquals(newMidpoint.second, afterPinch.second, .1f)
+    }
+
     @Test fun gifFramesFitAndPlaybackPauseResume() {
         assumeTrue(android.os.Build.VERSION.SDK_INT >= 28)
         listOf("fit-small.gif" to 0.5f, "fit-large.gif" to (2f / 3f)).forEach { (name, heightRatio) ->
@@ -270,12 +422,132 @@ class ViewerRegressionTest {
         return try { activity.dispatchGenericMotionEvent(event) } finally { event.recycle() }
     }
 
+    private fun configurePhotoForZoom() {
+        photo().setImageSource(48, 64, 1, false)
+        photo().setDrawable(android.graphics.drawable.ColorDrawable(Color.WHITE))
+    }
+
+    private fun sendPhotoTouch(action: Int, downTime: Long, eventTime: Long, x: Float, y: Float) {
+        val event = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
+        event.source = InputDevice.SOURCE_TOUCHSCREEN
+        try { photo().dispatchTouchEvent(event) } finally { event.recycle() }
+    }
+
+    private fun pinchPoints(centerX: Float, centerY: Float, span: Float): List<Pair<Float, Float>> =
+        listOf((centerX - span / 2f) to centerY, (centerX + span / 2f) to centerY)
+
+    private fun sendMultiTouch(
+        action: Int,
+        downTime: Long,
+        eventTime: Long,
+        points: List<Pair<Float, Float>>,
+        actionIndex: Int = 0
+    ) = sendMultiTouch(photo(), action, downTime, eventTime, points, actionIndex)
+
+    private fun sendMultiTouch(
+        view: View,
+        action: Int,
+        downTime: Long,
+        eventTime: Long,
+        points: List<Pair<Float, Float>>,
+        actionIndex: Int = 0
+    ) {
+        val properties = Array(points.size) { index ->
+            MotionEvent.PointerProperties().apply {
+                id = index
+                toolType = MotionEvent.TOOL_TYPE_FINGER
+            }
+        }
+        val coords = Array(points.size) { index ->
+            MotionEvent.PointerCoords().apply {
+                x = points[index].first
+                y = points[index].second
+                pressure = 1f
+                size = 1f
+            }
+        }
+        val encodedAction = if (action == MotionEvent.ACTION_POINTER_DOWN || action == MotionEvent.ACTION_POINTER_UP)
+            action or (actionIndex shl MotionEvent.ACTION_POINTER_INDEX_SHIFT) else action
+        val event = MotionEvent.obtain(
+            downTime, eventTime, encodedAction, points.size, properties, coords,
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
+        try {
+            assertEquals(action, event.actionMasked)
+            assertEquals(points.size, event.pointerCount)
+            if (action == MotionEvent.ACTION_POINTER_DOWN || action == MotionEvent.ACTION_POINTER_UP) {
+                assertEquals(actionIndex, event.actionIndex)
+            }
+            view.dispatchTouchEvent(event)
+        } finally { event.recycle() }
+    }
+
+    private fun imagePointAt(x: Float, y: Float): Pair<Float, Float> = main {
+        val view = photo()
+        val scale = photoFieldFloat("fitScale") * photoFieldFloat("userScale")
+        ((x - view.width / 2f - photoFieldFloat("tx")) / scale + photoFieldInt("sourceWidth") / 2f) to
+            ((y - view.height / 2f - photoFieldFloat("ty")) / scale + photoFieldInt("sourceHeight") / 2f)
+    }
+
+    private fun photoFieldFloat(name: String): Float = PhotoView::class.java.getDeclaredField(name)
+        .apply { isAccessible = true }.getFloat(photo())
+
+    private fun photoFieldInt(name: String): Int = PhotoView::class.java.getDeclaredField(name)
+        .apply { isAccessible = true }.getInt(photo())
+
+    private fun mangaState(): MangaZoomState = main {
+        MangaZoomState(mangaFieldFloat("zoom"), mangaFieldFloat("panX"), mangaFieldFloat("contentOffset"))
+    }
+
+    private fun mangaContentPoint(
+        state: MangaZoomState,
+        viewportWidth: Float,
+        screenX: Float,
+        screenY: Float
+    ): Pair<Float, Float> =
+        ((screenX - viewportWidth / 2f - state.panX) / state.zoom + viewportWidth / 2f) to
+            ((screenY + state.contentOffset) / state.zoom)
+
+    private fun mangaScreenPoint(
+        state: MangaZoomState,
+        viewportWidth: Float,
+        contentX: Float,
+        contentY: Float
+    ): Pair<Float, Float> =
+        (viewportWidth / 2f - viewportWidth * state.zoom / 2f + state.panX + contentX * state.zoom) to
+            (contentY * state.zoom - state.contentOffset)
+
+    private fun mangaFieldFloat(name: String): Float = MangaView::class.java.getDeclaredField(name)
+        .apply { isAccessible = true }.getFloat(manga())
+
+    private fun mangaFieldBoolean(name: String): Boolean = MangaView::class.java.getDeclaredField(name)
+        .apply { isAccessible = true }.getBoolean(manga())
+
+    private fun setMangaField(name: String, value: Any) {
+        MangaView::class.java.getDeclaredField(name).apply { isAccessible = true }.set(manga(), value)
+    }
+
+    private fun sendViewTouch(view: View, action: Int, downTime: Long, eventTime: Long, x: Float, y: Float) {
+        val event = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
+        event.source = InputDevice.SOURCE_TOUCHSCREEN
+        try { view.dispatchTouchEvent(event) } finally { event.recycle() }
+    }
+
     private fun screenshotCenter(): Int {
         val image = ins.uiAutomation.takeScreenshot()
         return try { image.getPixel(image.width / 2, image.height / 2) } finally { image.recycle() }
     }
     private fun black(pixel: Int) = Color.red(pixel) < 20 && Color.green(pixel) < 20 && Color.blue(pixel) < 20
 
+    private fun showManga(): MangaView = main {
+        val container = invoke("buildMangaViewerPage") as View
+        val root = field("stableRoot") as android.view.ViewGroup
+        root.removeAllViews()
+        root.addView(container, android.view.ViewGroup.LayoutParams(-1, -1))
+        findView(container) { it is MangaView } as MangaView
+    }
+
+    private fun manga() = field("mangaViewer") as MangaView
     private fun show(list: List<Pic>, index: Int) = invoke("showViewer", list, index, Page.ALBUMS)
     private fun step(value: Int) = invoke("requestImageStep", value)
     private fun photo() = field("viewer") as PhotoView

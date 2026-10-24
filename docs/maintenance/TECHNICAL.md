@@ -1,7 +1,7 @@
 # MiniPic 技术说明
 
-> 验证日期：2026-10-01；36 项 JVM 和 12 项 OWW211 instrumentation 测试通过。
-> 当前版本：0.0.7（versionCode 7）
+> 验证日期：2026-10-24；39 项 JVM 和 16 项 OWW211 instrumentation 测试通过。
+> 当前版本：0.0.8（versionCode 8）
 > 项目根目录：当前工作区；Android 工程位于 `android/`
 
 ## 技术基线
@@ -82,7 +82,7 @@ $env:MINIPIC_KEYSTORE_PROPERTIES='D:\secure\minipic\keystore.properties'
 .\gradlew.bat testDebugUnitTest assembleDebug lintDebug assembleRelease
 ```
 
-当前版本包含 36 项 JVM 测试，覆盖扫描/分组、文件元数据变化、自然排序、表冠灵敏度及100阈值分页累计、索引钳制、fit 尺寸、采样预算、EXIF 映射和漫画 Bitmap 预算。12 项 Android instrumentation 测试已在 OWW211/API 30 通过，覆盖快速/反向目标、上下动画方向与中断接续、表冠100阈值和立即响应、触摸共用切图流程、失败/离页取消、三轴输入、触摸取消、GIF fit/换帧/暂停恢复、滑块持久化和标题退出。0.0.7 Debug/Release、Lint 和三类 APK 签名校验均成功。
+当前版本包含 39 项 JVM 测试，覆盖扫描/分组、文件元数据变化、自然排序、表冠灵敏度及100阈值分页累计、索引钳制、fit 尺寸、采样预算、EXIF 映射、漫画 Bitmap 预算和漫画缩放锚点坐标。16 项 Android instrumentation 测试已在 OWW211/API 30 通过，覆盖普通单图与漫画模式的表冠中心、双击第二次按压、双指中点及中点移动锚点。0.0.8 Debug/Release、Lint 和三类 APK 签名校验均成功。
 
 Release 输出：
 

@@ -369,4 +369,72 @@ class GalleryModelTest {
         assertEquals("no-extension (1)", uniqueFileName("no-extension") { it == "no-extension" })
         assertNotEquals("photo.jpg", uniqueFileName("photo.jpg") { it in existing })
     }
+
+    @Test
+    fun mangaCrownZoomKeepsViewportCenterAnchored() {
+        val viewportWidth = 378f
+        val viewportHeight = 496f
+        val centerX = viewportWidth / 2f
+        val centerY = viewportHeight / 2f
+        val before = MangaZoomState(2f, -38f, 420f)
+        val contentPoint = mangaContentPoint(before, viewportWidth, centerX, centerY)
+        val after = mangaZoomState(before, viewportWidth, 3f, centerX, centerY)
+        val mapped = mangaScreenPoint(after, viewportWidth, contentPoint.first, contentPoint.second)
+
+        assertEquals(centerX, mapped.first, .001f)
+        assertEquals(centerY, mapped.second, .001f)
+    }
+
+    @Test
+    fun mangaDoubleTapSlideZoomKeepsSecondPressAnchored() {
+        val viewportWidth = 378f
+        val anchor = 83f to 307f
+        val before = MangaZoomState(1.25f, 17f, 180f)
+        val contentPoint = mangaContentPoint(before, viewportWidth, anchor.first, anchor.second)
+        val after = mangaZoomState(before, viewportWidth, 2.5f, anchor.first, anchor.second)
+        val mapped = mangaScreenPoint(after, viewportWidth, contentPoint.first, contentPoint.second)
+
+        assertEquals(anchor.first, mapped.first, .001f)
+        assertEquals(anchor.second, mapped.second, .001f)
+    }
+
+    @Test
+    fun mangaPinchZoomKeepsContentUnderMovingMidpoint() {
+        val viewportWidth = 378f
+        val before = MangaZoomState(1.5f, -22f, 260f)
+        val oldMidpoint = 112f to 184f
+        val newMidpoint = 154f to 231f
+        val contentPoint = mangaContentPoint(before, viewportWidth, oldMidpoint.first, oldMidpoint.second)
+        val after = mangaZoomState(
+            before,
+            viewportWidth,
+            2.25f,
+            oldMidpoint.first,
+            oldMidpoint.second,
+            newMidpoint.first,
+            newMidpoint.second
+        )
+        val mapped = mangaScreenPoint(after, viewportWidth, contentPoint.first, contentPoint.second)
+
+        assertEquals(newMidpoint.first, mapped.first, .001f)
+        assertEquals(newMidpoint.second, mapped.second, .001f)
+    }
+
+    private fun mangaContentPoint(
+        state: MangaZoomState,
+        viewportWidth: Float,
+        screenX: Float,
+        screenY: Float
+    ): Pair<Float, Float> =
+        ((screenX - viewportWidth / 2f - state.panX) / state.zoom + viewportWidth / 2f) to
+            ((screenY + state.contentOffset) / state.zoom)
+
+    private fun mangaScreenPoint(
+        state: MangaZoomState,
+        viewportWidth: Float,
+        contentX: Float,
+        contentY: Float
+    ): Pair<Float, Float> =
+        (viewportWidth / 2f - viewportWidth * state.zoom / 2f + state.panX + contentX * state.zoom) to
+            (contentY * state.zoom - state.contentOffset)
 }
