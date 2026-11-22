@@ -154,7 +154,7 @@ class MangaView(
             paint.color = Color.WHITE
             paint.textSize = 16f * resources.displayMetrics.density
             paint.textAlign = Paint.Align.CENTER
-            canvas.drawText("正在加载漫画…", width / 2f, height / 2f, paint)
+            canvas.drawText(context.getString(R.string.loading_manga), width / 2f, height / 2f, paint)
             paint.color = Color.WHITE
             paint.textAlign = Paint.Align.LEFT
             return

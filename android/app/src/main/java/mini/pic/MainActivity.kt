@@ -54,6 +54,13 @@ data class ImageMetadata(
 enum class Page { ALBUMS, SETTINGS, VIEWER, ACTIONS, PICK_ALBUM, SELECT_ALBUMS }
 
 class MainActivity : Activity() {
+    private enum class PhotoAction(val labelRes: Int) {
+        COPY(R.string.action_copy), MOVE(R.string.action_move), DELETE(R.string.action_delete),
+        ROTATE(R.string.action_rotate), SET_COVER(R.string.action_set_cover)
+    }
+
+    private enum class FileOpResult { COPIED, MOVED, SOURCE_DELETE_FAILED, FAILED }
+
     // ── stable page container ──────────────────────────────────────────
     private lateinit var stableRoot: GestureFrameLayout
 
@@ -93,7 +100,7 @@ class MainActivity : Activity() {
     private var rotation = 0f
     private var scanning = false
     private var animating = false
-    private var pendingFileOp: String? = null
+    private var pendingFileOp: PhotoAction? = null
     private val coverPrefs by lazy { getSharedPreferences("covers", MODE_PRIVATE) }
 
     private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
@@ -173,11 +180,11 @@ class MainActivity : Activity() {
                 return
             }
             MaterialAlertDialogBuilder(this)
-                .setTitle("需要图库访问权限")
-                .setMessage("完整管理相册需要文件访问权限；也可以只授予图片读取权限。")
-                .setNegativeButton("暂不") { _, _ -> showPermissionHint() }
-                .setNeutralButton("仅浏览图片") { _, _ -> requestPermissions(arrayOf(readPermission), 9) }
-                .setPositiveButton("完整访问") { _, _ -> requestAllFilesAccess() }
+                .setTitle(R.string.gallery_permission_title)
+                .setMessage(R.string.gallery_permission_message)
+                .setNegativeButton(R.string.not_now) { _, _ -> showPermissionHint() }
+                .setNeutralButton(R.string.browse_only) { _, _ -> requestPermissions(arrayOf(readPermission), 9) }
+                .setPositiveButton(R.string.full_access) { _, _ -> requestAllFilesAccess() }
                 .setOnCancelListener { showPermissionHint() }
                 .show()
             return
@@ -192,7 +199,7 @@ class MainActivity : Activity() {
     private fun showPermissionHint() {
         permissionDenied = true
         if (page == Page.ALBUMS && albums.isEmpty()) albumAdapter?.notifyItemChanged(0)
-        toast("未授予图库访问权限")
+        toast(getString(R.string.gallery_permission_denied))
     }
 
     private var activityResumed = false
@@ -226,7 +233,7 @@ class MainActivity : Activity() {
         } else if (code == 9) showPermissionHint()
         if (code == 10 && g.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
             pendingWriteAction?.also { pendingWriteAction = null; it() }
-        } else if (code == 10) toast("未授予文件写入权限")
+        } else if (code == 10) toast(getString(R.string.write_permission_denied))
     }
 
     private fun hasWriteAccess(): Boolean {
@@ -240,10 +247,10 @@ class MainActivity : Activity() {
         } else if (Build.VERSION.SDK_INT >= 30) {
             pendingWriteAction = onGranted
             MaterialAlertDialogBuilder(this)
-                .setTitle("需要文件访问权限")
-                .setMessage("为了复制、移动和删除图片，请授予「所有文件访问权限」")
-                .setNegativeButton("取消") { _, _ -> pendingWriteAction = null }
-                .setPositiveButton("去设置") { _, _ -> requestAllFilesAccess() }.show()
+                .setTitle(R.string.file_permission_title)
+                .setMessage(R.string.file_permission_message)
+                .setNegativeButton(R.string.cancel) { _, _ -> pendingWriteAction = null }
+                .setPositiveButton(R.string.open_settings) { _, _ -> requestAllFilesAccess() }.show()
         } else {
             pendingWriteAction = onGranted
             requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 10)
@@ -271,7 +278,7 @@ class MainActivity : Activity() {
             } catch (_: Exception) {
                 permissionSettingsRequested = false
                 showPermissionHint()
-                toast("请在系统设置中授予图库文件访问权限")
+                toast(getString(R.string.file_permission_hint))
             }
         }
     }
@@ -697,7 +704,7 @@ class MainActivity : Activity() {
                 imageLoadFuture = null
                 pendingViewerIndex = null
                 if (drawable == null) {
-                    toast("图片加载失败")
+                    toast(getString(R.string.image_load_failed))
                     return@runOnUiThread
                 }
                 // Commit the target only after decode succeeds; actions stay aligned with the incoming image.
@@ -739,9 +746,9 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(7), dp(2), dp(7), dp(10))
         }
-        column.addView(label("相册", 20f, true).apply {
+        column.addView(label(getString(R.string.albums), 20f, true).apply {
             gravity = Gravity.CENTER
-            contentDescription = "相册，退出应用"
+            contentDescription = getString(R.string.albums_exit_description)
             setOnClickListener { finishAndRemoveTask() }
         }, LinearLayout.LayoutParams(-1, dp(33)))
 
@@ -809,9 +816,9 @@ class MainActivity : Activity() {
             if (items.isEmpty()) {
                 holder.host.addView(label(
                     when {
-                        permissionDenied -> "需要图片访问权限"
-                        scanning -> "正在扫描…"
-                        else -> "暂无相册"
+                        permissionDenied -> getString(R.string.photo_access_required)
+                        scanning -> getString(R.string.scanning)
+                        else -> getString(R.string.no_albums)
                     }, 14f
                 ).apply {
                     gravity = Gravity.CENTER
@@ -828,19 +835,19 @@ class MainActivity : Activity() {
         page = Page.SETTINGS
         settingsScroll = ScrollView(this).apply { overScrollMode = View.OVER_SCROLL_NEVER }
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(3), dp(8), dp(12)) }
-        column.addView(label("设置", 20f, true).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(-1, dp(34)))
-        column.addView(settingCard("主页相册", "选择展示在主页的相册") { showAlbumSelection() })
-        column.addView(settingCard("新建相册", "在 Pictures 中创建") { newAlbum() })
-        column.addView(switchCard("表冠滚动缩放", prefs.getBoolean("crownZoom", true)) {
+        column.addView(label(getString(R.string.settings), 20f, true).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(-1, dp(34)))
+        column.addView(settingCard(getString(R.string.home_albums), getString(R.string.home_albums_summary)) { showAlbumSelection() })
+        column.addView(settingCard(getString(R.string.new_album), getString(R.string.new_album_summary)) { ensureWriteAccess { newAlbum() } })
+        column.addView(switchCard(getString(R.string.crown_zoom), prefs.getBoolean("crownZoom", true)) {
             prefs.edit().putBoolean("crownZoom", it).apply()
             crownPages.reset()
         })
         column.addView(crownSensitivityControl())
-        column.addView(switchCard("开启漫画模式", mangaMode) { prefs.edit().putBoolean("mangaMode", it).apply() })
-        column.addView(switchCard("扫描隐藏文件", prefs.getBoolean("hidden", false)) { prefs.edit().putBoolean("hidden", it).apply(); scan() })
+        column.addView(switchCard(getString(R.string.enable_manga_mode), mangaMode) { prefs.edit().putBoolean("mangaMode", it).apply() })
+        column.addView(switchCard(getString(R.string.scan_hidden_files), prefs.getBoolean("hidden", false)) { prefs.edit().putBoolean("hidden", it).apply(); scan() })
         column.addView(themeCard())
-        column.addView(settingCard("重新扫描", "更新本地图片列表") { scan(); toast("正在扫描…") })
-        column.addView(settingCard("许可证", "GNU AGPL-3.0，无担保") { showLicenseDialog() })
+        column.addView(settingCard(getString(R.string.rescan), getString(R.string.rescan_summary)) { scan(); toast(getString(R.string.scanning)) })
+        column.addView(settingCard(getString(R.string.license), getString(R.string.license_summary)) { showLicenseDialog() })
         settingsScroll!!.addView(column)
         return settingsScroll!!
     }
@@ -851,12 +858,11 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
             setPadding(dp(14), dp(4), dp(14), dp(4))
         }
-        val actions = if (mangaViewer != null)
-            mutableListOf("复制", "移动", "删除")
-        else mutableListOf("复制", "移动", "删除", "旋转")
-        if (!isExternal) actions += "设为封面"
-        actions.forEach { name ->
-            column.addView(actionPill(name) { runAction(name) },
+        val actions = mutableListOf(PhotoAction.COPY, PhotoAction.MOVE, PhotoAction.DELETE)
+        if (mangaViewer == null) actions += PhotoAction.ROTATE
+        if (!isExternal) actions += PhotoAction.SET_COVER
+        actions.forEach { action ->
+            column.addView(actionPill(getString(action.labelRes)) { runAction(action) },
                 LinearLayout.LayoutParams(-1, 0, 1f).apply { setMargins(0, dp(3), 0, dp(3)) })
         }
         return column
@@ -1081,15 +1087,15 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(8), dp(3), dp(8), dp(12))
         }
-        column.addView(label("选择目标相册", 20f, true).apply { gravity = Gravity.CENTER },
+        column.addView(label(getString(R.string.choose_destination_album), 20f, true).apply { gravity = Gravity.CENTER },
             LinearLayout.LayoutParams(-1, dp(34)))
 
         if (albums.isEmpty()) {
-            column.addView(label("没有可选相册，请先创建", 13f).apply { gravity = Gravity.CENTER })
+            column.addView(label(getString(R.string.no_destination_albums), 13f).apply { gravity = Gravity.CENTER })
         } else {
             // Show each album as a selectable card, excluding current if moving
             for ((folder, photos) in albums) {
-                if (pendingFileOp == "移动" && folder == currentFolder) continue
+                if (pendingFileOp == PhotoAction.MOVE && folder == currentFolder) continue
                 column.addView(pickerAlbumCard(folder, photos, currentFolder))
             }
         }
@@ -1121,7 +1127,7 @@ class MainActivity : Activity() {
             tag = folder
         }
         row.addView(cover)
-        row.addView(label(File(folder).name.ifBlank { "存储" }, 14f, true), LinearLayout.LayoutParams(0, -1, 1f))
+        row.addView(label(File(folder).name.ifBlank { getString(R.string.storage) }, 14f, true), LinearLayout.LayoutParams(0, -1, 1f))
         c.addView(row)
         return c.apply { layoutParams = LinearLayout.LayoutParams(-1, dp(52)).apply { setMargins(0, dp(3), 0, dp(3)) } }
     }
@@ -1133,7 +1139,7 @@ class MainActivity : Activity() {
         val srcPath = pic.path
 
         fileIo.execute {
-            val result = try {
+            val (result, errorDetails) = try {
                 val srcUri = Uri.parse(srcPath)
                 val srcName = if (srcUri.scheme == "content") {
                     val cursor = contentResolver.query(srcUri, arrayOf("_display_name"), null, null, null)
@@ -1141,34 +1147,41 @@ class MainActivity : Activity() {
                         ?: srcUri.lastPathSegment ?: "image.jpg"
                 } else if (srcUri.scheme == "file") File(srcUri.path!!).name else File(srcPath).name
 
-                when (op) {
-                    "复制" -> {
-                        if (!mediaStoreCopy(targetFolder, srcPath, srcName))
-                            throw IOException("目标写入失败，原图未更改")
-                        "已复制到 ${File(targetFolder).name}"
-                    }
-                    "移动" -> {
-                        if (!mediaStoreCopy(targetFolder, srcPath, srcName))
-                            throw IOException("目标写入失败，原图未更改")
-                        if (!mediaStoreDelete(srcPath)) {
-                            "复制成功，但无法删除原图；移动未完成"
-                        } else {
-                            "已移动到 ${File(targetFolder).name}"
-                        }
-                    }
-                    else -> throw IOException("未知操作")
+                check(op == PhotoAction.COPY || op == PhotoAction.MOVE)
+                if (!mediaStoreCopy(targetFolder, srcPath, srcName)) {
+                    throw IOException(getString(R.string.file_write_failed))
                 }
+                when {
+                    op == PhotoAction.COPY -> FileOpResult.COPIED
+                    mediaStoreDelete(srcPath) -> FileOpResult.MOVED
+                    else -> FileOpResult.SOURCE_DELETE_FAILED
+                } to null
             } catch (e: Exception) {
-                "${op}失败: ${e.localizedMessage ?: "未知错误"}；原图未更改"
+                FileOpResult.FAILED to e.localizedMessage
             }
-            if (isFinishing || isDestroyed) return@execute
             runOnUiThread {
-                toast(result)
-                if (result.startsWith("已移动到")) {
-                    if (isExternal) finish() else { scan(); showAlbums() }
-                } else {
-                    if (result.startsWith("已复制到") || result.startsWith("复制成功")) scan()
-                    showPhotoView()
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                val albumName = File(targetFolder).name.ifBlank { getString(R.string.storage) }
+                when (result) {
+                    FileOpResult.COPIED -> {
+                        toast(getString(R.string.copied_to_album, albumName))
+                        scan()
+                        showPhotoView()
+                    }
+                    FileOpResult.MOVED -> {
+                        toast(getString(R.string.moved_to_album, albumName))
+                        if (isExternal) finish() else { scan(); showAlbums() }
+                    }
+                    FileOpResult.SOURCE_DELETE_FAILED -> {
+                        toast(getString(R.string.move_source_delete_failed))
+                        scan()
+                        showPhotoView()
+                    }
+                    FileOpResult.FAILED -> {
+                        val message = if (op == PhotoAction.COPY) R.string.copy_failed else R.string.move_failed
+                        toast(getString(message, errorDetails ?: getString(R.string.unknown_error)))
+                        showPhotoView()
+                    }
                 }
             }
         }
@@ -1244,15 +1257,15 @@ class MainActivity : Activity() {
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
                 inserted = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                    ?: throw IOException("无法创建目标图片")
+                    ?: throw IOException(getString(R.string.destination_create_image_failed))
                 val output = contentResolver.openOutputStream(inserted, "w")
-                    ?: throw IOException("无法打开目标图片")
+                    ?: throw IOException(getString(R.string.destination_open_image_failed))
                 val copied = source.use { input -> output.use { input.copyTo(it, 64 * 1024) } }
                 if (copied <= 0L || (expectedLength != null && copied != expectedLength))
-                    throw IOException("图片内容长度不匹配")
+                    throw IOException(getString(R.string.destination_size_mismatch))
                 val committed = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
                 if (contentResolver.update(inserted, committed, null, null) <= 0)
-                    throw IOException("无法提交目标图片")
+                    throw IOException(getString(R.string.destination_commit_failed))
                 return true
             } catch (_: Exception) {
                 try { inserted?.let { contentResolver.delete(it, null, null) } } catch (_: Exception) {}
@@ -1264,7 +1277,7 @@ class MainActivity : Activity() {
         var tempFile: File? = null
         return try {
             val dir = File(albumFolder)
-            if (!dir.isDirectory && !dir.mkdirs()) throw IOException("无法创建目标相册")
+            if (!dir.isDirectory && !dir.mkdirs()) throw IOException(getString(R.string.destination_create_album_failed))
             val destination = resolveDestName(dir, fileName)
             val temp = File(dir, ".${destination.name}.${System.nanoTime()}.tmp")
             tempFile = temp
@@ -1277,7 +1290,7 @@ class MainActivity : Activity() {
             }
             if (copied <= 0L || temp.length() != copied ||
                 (expectedLength != null && copied != expectedLength) || !temp.renameTo(destination))
-                throw IOException("无法完成图片写入")
+                throw IOException(getString(R.string.destination_write_failed))
             true
         } catch (_: Exception) {
             try { tempFile?.delete() } catch (_: Exception) {}
@@ -1416,7 +1429,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(8), dp(3), dp(8), dp(12))
         }
-        column.addView(label("选择主页相册", 20f, true).apply { gravity = Gravity.CENTER },
+        column.addView(label(getString(R.string.choose_home_albums), 20f, true).apply { gravity = Gravity.CENTER },
             LinearLayout.LayoutParams(-1, dp(34)))
 
         for ((folder, _) in albums) {
@@ -1441,7 +1454,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(14), 0, dp(8), 0)
         }
-        row.addView(label(File(folder).name.ifBlank { "存储" }, 13f, true),
+        row.addView(label(File(folder).name.ifBlank { getString(R.string.storage) }, 13f, true),
             LinearLayout.LayoutParams(0, -1, 1f))
         val sw = SwitchMaterial(this).apply {
             isChecked = checked
@@ -1456,7 +1469,7 @@ class MainActivity : Activity() {
         val pic = viewerPics.getOrNull(viewerIndex) ?: return
         val folder = pic.folder
         coverPrefs.edit().putString(folder, pic.path).apply()
-        toast("已设为相册封面")
+        toast(getString(R.string.cover_set))
     }
 
     private fun getCoverPath(folder: String): String? = coverPrefs.getString(folder, null)
@@ -1475,31 +1488,33 @@ class MainActivity : Activity() {
     //  ACTIONS
     // ══════════════════════════════════════════════════════════════════
 
-    private fun runAction(name: String) {
-        when (name) {
-            "旋转" -> { rotation = (rotation + 90f) % 360f; showPhotoView() }
-            "删除" -> ensureWriteAccess { confirmDelete() }
-            "复制" -> { pendingFileOp = "复制"; ensureWriteAccess { showAlbumPicker() } }
-            "移动" -> { pendingFileOp = "移动"; ensureWriteAccess { showAlbumPicker() } }
-            "设为封面" -> setAsCover()
+    private fun runAction(action: PhotoAction) {
+        when (action) {
+            PhotoAction.ROTATE -> { rotation = (rotation + 90f) % 360f; showPhotoView() }
+            PhotoAction.DELETE -> ensureWriteAccess { confirmDelete() }
+            PhotoAction.COPY, PhotoAction.MOVE -> {
+                pendingFileOp = action
+                ensureWriteAccess { showAlbumPicker() }
+            }
+            PhotoAction.SET_COVER -> setAsCover()
         }
     }
 
     private fun confirmDelete() {
         MaterialAlertDialogBuilder(this)
-            .setTitle("删除这张图片？")
-            .setMessage("删除后无法恢复")
-            .setNegativeButton("取消", null)
-            .setPositiveButton("删除") { _, _ ->
+            .setTitle(R.string.delete_photo_title)
+            .setMessage(R.string.delete_photo_message)
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.action_delete) { _, _ ->
                 val p = viewerPics[viewerIndex].path
                 fileIo.execute {
                     val ok = mediaStoreDelete(p)
                     if (isFinishing || isDestroyed) return@execute
                     runOnUiThread {
                         if (ok) {
-                            toast("已删除")
+                            toast(getString(R.string.photo_deleted))
                             if (isExternal) finish() else { scan(); showAlbums() }
-                        } else toast("删除失败，原图未修改")
+                        } else toast(getString(R.string.photo_delete_failed))
                     }
                 }
             }.show()
@@ -1586,14 +1601,14 @@ class MainActivity : Activity() {
             }
         }
         body.addView(cover, LinearLayout.LayoutParams(-1, dp(68)))
-        body.addView(label(File(folder).name.ifBlank { "存储" }, 12f, true).apply {
+        body.addView(label(File(folder).name.ifBlank { getString(R.string.storage) }, 12f, true).apply {
             maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(dp(7), dp(3), dp(5), 0)
         }, LinearLayout.LayoutParams(-1, dp(26)))
         card.addView(body)
         card.setOnClickListener {
             if (photos.isNotEmpty()) showViewer(photos, 0, Page.ALBUMS)
-            else toast("这个相册还是空的")
+            else toast(getString(R.string.empty_album))
         }
         return card
     }
@@ -1601,10 +1616,7 @@ class MainActivity : Activity() {
     private fun settingCard(title: String, subtitle: String, action: () -> Unit): View {
         val c = MaterialCardView(this).apply {
             radius = dp(16).toFloat(); setCardBackgroundColor(surface); cardElevation = 0f
-            setOnClickListener {
-                if (title == "新建相册") ensureWriteAccess { action() }
-                else action()
-            }
+            setOnClickListener { action() }
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(dp(14), dp(9), dp(10), dp(8))
@@ -1625,13 +1637,13 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(7), dp(14), dp(5))
         }
-        val valueLabel = label("${(crownSensitivity * 100f).roundToInt()}%", 12f, true).apply {
+        val valueLabel = label(getString(R.string.crown_sensitivity_percent, (crownSensitivity * 100f).roundToInt()), 12f, true).apply {
             gravity = Gravity.END
             setTextColor(accent)
         }
         val titleRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL
-            addView(label("表冠灵敏度", 13f, true), LinearLayout.LayoutParams(0, dp(24), 1f))
+            addView(label(getString(R.string.crown_sensitivity), 13f, true), LinearLayout.LayoutParams(0, dp(24), 1f))
             addView(valueLabel, LinearLayout.LayoutParams(dp(52), dp(24)))
         }
         val slider = android.widget.SeekBar(this).apply {
@@ -1643,7 +1655,7 @@ class MainActivity : Activity() {
                     val sensitivity = MIN_CROWN_SENSITIVITY +
                         (MAX_CROWN_SENSITIVITY - MIN_CROWN_SENSITIVITY) * value / max.toFloat()
                     prefs.edit().putFloat("crownSensitivity", sensitivity).apply()
-                    valueLabel.text = "${(sensitivity * 100f).roundToInt()}%"
+                    valueLabel.text = getString(R.string.crown_sensitivity_percent, (sensitivity * 100f).roundToInt())
                     crownPages.reset()
                     crownScrollRemainder = 0f
                 }
@@ -1679,10 +1691,10 @@ class MainActivity : Activity() {
             radius = dp(16).toFloat(); setCardBackgroundColor(surface); cardElevation = 0f
         }
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(6), dp(12), dp(8)) }
-        box.addView(label("外观", 13f, true))
+        box.addView(label(getString(R.string.appearance), 13f, true))
         val row = LinearLayout(this)
-        row.addView(themeChoice("深色", true), LinearLayout.LayoutParams(0, dp(38), 1f))
-        row.addView(themeChoice("浅色", false), LinearLayout.LayoutParams(0, dp(38), 1f))
+        row.addView(themeChoice(getString(R.string.theme_dark), true), LinearLayout.LayoutParams(0, dp(38), 1f))
+        row.addView(themeChoice(getString(R.string.theme_light), false), LinearLayout.LayoutParams(0, dp(38), 1f))
         box.addView(row); c.addView(box)
         return c.apply { layoutParams = LinearLayout.LayoutParams(-1, dp(66)).apply { setMargins(0, dp(3), 0, dp(3)) } }
     }
@@ -1704,30 +1716,25 @@ class MainActivity : Activity() {
 
     private fun showLicenseDialog() {
         MaterialAlertDialogBuilder(this)
-            .setTitle("MiniPic 许可证")
-            .setMessage(
-                "Copyright (C) 2026 Mooncyer\n\n" +
-                    "MiniPic 按 GNU Affero General Public License v3.0 发布。\n\n" +
-                    "本应用按现状提供，不提供任何明示或默示担保。完整许可证文本位于源码仓库根目录的 LICENSE 文件：\n" +
-                    "https://github.com/Mooncyer/MiniPic/blob/master/LICENSE"
-            )
-            .setPositiveButton("关闭", null)
+            .setTitle(R.string.license_title)
+            .setMessage(R.string.license_message)
+            .setPositiveButton(R.string.close, null)
             .show()
     }
 
     private fun newAlbum() {
-        val input = EditText(this).apply { hint = "相册名称"; setSingleLine() }
+        val input = EditText(this).apply { hint = getString(R.string.album_name); setSingleLine() }
         MaterialAlertDialogBuilder(this)
-            .setTitle("新建相册")
+            .setTitle(R.string.new_album)
             .setView(input)
-            .setNegativeButton("取消", null)
-            .setPositiveButton("创建") { _, _ ->
+            .setNegativeButton(R.string.cancel, null)
+            .setPositiveButton(R.string.create) { _, _ ->
                 val name = input.text.toString().trim()
                 if (name.isBlank() || name.contains(Regex("[\\\\/:*?\"<>|]")))
-                    return@setPositiveButton toast("名称无效")
+                    return@setPositiveButton toast(getString(R.string.invalid_album_name))
                 val dir = File("/storage/emulated/0/Pictures", name)
                 if (!dir.mkdirs())
-                    return@setPositiveButton toast(if (dir.exists()) "相册已存在" else "创建失败")
+                    return@setPositiveButton toast(if (dir.exists()) getString(R.string.album_exists) else getString(R.string.album_create_failed))
                 try {
                     resources.openRawResource(R.raw.minipic_gallery_signature).use { ins ->
                         File(dir, SIGNATURE).outputStream().use { ins.copyTo(it) }

@@ -16,7 +16,8 @@ MiniPic is a native Android gallery and comic reader designed for smartwatches, 
 | --- | --- |
 | 应用名称 | MiniPic / 图库 |
 | Application ID | `mini.pic` |
-| 当前版本 | `0.0.8` / `versionCode 8` |
+| 当前版本 | `0.0.9` / `versionCode 9` |
+| 界面语言 | 跟随 Android 系统语言，支持简体中文和英文，默认资源为英文 |
 | 主要设备 | OPPO Watch OWW211，Android 11，378 × 496 |
 | 最低系统 | Android API 23 |
 | 编译 / 目标 SDK | 35 / 35 |
@@ -25,7 +26,7 @@ MiniPic is a native Android gallery and comic reader designed for smartwatches, 
 | 支持 ABI | `armeabi-v7a`、`arm64-v8a`、Universal |
 | 许可证 | [GNU AGPL-3.0](LICENSE) |
 
-这是一个仍在持续开发中的个人项目。0.0.8 已通过 39 项 JVM 测试、16 项 OWW211 instrumentation 测试、Android Lint、Debug/Release 构建，并在手表上完成同签名覆盖安装与回归验证；实体表冠的机械手感仍需手动验收。应用尚未发布到应用商店，也不承诺适配所有 Android 手表型号。
+0.0.9 在 OWW211 上验证了从英文切换到简体中文、再切回英文时，相册和设置会随系统语言更新。实体表冠的机械手感仍需手动验收。
 
 ## 功能
 

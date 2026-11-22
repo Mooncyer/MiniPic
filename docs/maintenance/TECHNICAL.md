@@ -1,14 +1,14 @@
 # MiniPic 技术说明
 
-> 验证日期：2026-10-24；39 项 JVM 和 16 项 OWW211 instrumentation 测试通过。
-> 当前版本：0.0.8（versionCode 8）
+> 2026-11-22 验证通过 39 项 JVM 测试和 18 项 OWW211 instrumentation 测试。
+> 当前版本为 0.0.9（versionCode 9）。
 > 项目根目录：当前工作区；Android 工程位于 `android/`
 
 ## 技术基线
 
 | 项目 | 当前值 |
 |---|---|
-| 应用 / 包名 | 图库 / `mini.pic` |
+| 应用 / 包名 | MiniPic / 图库 / `mini.pic` |
 | Kotlin / Java | Kotlin 1.9.20 / Java 17 |
 | AGP / Gradle | 8.1.0 / 8.13 |
 | compileSdk / targetSdk / minSdk | 35 / 35 / 23 |
@@ -82,7 +82,7 @@ $env:MINIPIC_KEYSTORE_PROPERTIES='D:\secure\minipic\keystore.properties'
 .\gradlew.bat testDebugUnitTest assembleDebug lintDebug assembleRelease
 ```
 
-当前版本包含 39 项 JVM 测试，覆盖扫描/分组、文件元数据变化、自然排序、表冠灵敏度及100阈值分页累计、索引钳制、fit 尺寸、采样预算、EXIF 映射、漫画 Bitmap 预算和漫画缩放锚点坐标。16 项 Android instrumentation 测试已在 OWW211/API 30 通过，覆盖普通单图与漫画模式的表冠中心、双击第二次按压、双指中点及中点移动锚点。0.0.8 Debug/Release、Lint 和三类 APK 签名校验均成功。
+当前版本包含 39 项 JVM 测试，覆盖扫描/分组、文件元数据变化、自然排序、表冠灵敏度及100阈值分页累计、索引钳制、fit 尺寸、采样预算、EXIF 映射、漫画 Bitmap 预算和漫画缩放锚点坐标。18 项 Android instrumentation 测试已在 OWW211/API 30 通过，涵盖看图回归与语言资源选择。新增用例验证了简体中文、英文、法语环境下的英文回退，以及含百分号的相册名在消息中的格式化。0.0.9 的 Debug、Release 构建、Lint 和三类 APK 签名校验均成功。
 
 Release 输出：
 

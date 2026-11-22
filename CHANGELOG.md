@@ -2,6 +2,23 @@
 
 MiniPic follows a lightweight release history. Detailed device and verification notes remain in [`docs/maintenance/DEVELOPMENT_STATUS.md`](docs/maintenance/DEVELOPMENT_STATUS.md).
 
+## [0.0.9] - 2026-11-22
+
+### Added
+
+- MiniPic follows Android’s language settings. The interface and launcher label support English and Simplified Chinese, with English as the default resource language.
+- Localized gallery and settings screens, permission and file-operation messages, and the manga loading indicator.
+
+### Fixed
+
+- File actions and follow-up navigation are independent of translated labels and messages.
+
+### Verification
+
+- 39 JVM tests and 18 OWW211 instrumentation tests passed. Android Lint reported 0 errors and 15 warnings.
+- The signed Universal APK upgraded 0.0.8 on OWW211. After changing the watch language from English to Simplified Chinese and back, MiniPic followed the system language.
+- Universal, `armeabi-v7a`, and `arm64-v8a` APKs passed signature verification with the existing release certificate.
+
 ## [0.0.8] - 2026-10-24
 
 ### Changed

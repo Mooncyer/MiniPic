@@ -407,7 +407,9 @@ class ViewerRegressionTest {
 
     @Test fun albumsTitleFinishesOwnActivity() {
         main { invoke("showAlbums") }
-        val title = findView(main { field("stableRoot") as View }) { it.contentDescription == "相册，退出应用" }
+        val title = findView(main { field("stableRoot") as View }) {
+            it.contentDescription == activity.getString(R.string.albums_exit_description)
+        }
         assertNotNull(title)
         main { title!!.performClick() }
         await { activity.isFinishing || activity.isDestroyed }
